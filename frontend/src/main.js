@@ -188,7 +188,7 @@ class AppRoot extends LitElement {
     return html`
       <header>
         <h1>ANIML NVR</h1>
-        <div style="display:flex; align-items:center; gap: 10px;">
+        <div class="header-actions">
              <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector v5</sl-button>
         </div>
       </header>
@@ -210,7 +210,7 @@ class AppRoot extends LitElement {
 
         <!-- List Column -->
         <div id="list-col">
-            <div class="section-title" style="padding: var(--sl-spacing-medium);">Videos (${this.videoList.length})</div>
+            <div class="section-title list-header">Videos (${this.videoList.length})</div>
             ${this.videoList.map(v => html`
                 <div class="video-item ${this.currentVideo === v.path ? 'active' : ''}" @click=${() => state.selectVideo(v.path)}>
                     <div class="video-title" title="${v.name}">${v.name}</div>
@@ -220,7 +220,7 @@ class AppRoot extends LitElement {
                     </div>
                     <div class="video-meta">
                         <span>Video</span>
-                        <sl-icon-button name="trash" style="font-size: 1rem;" label="Delete" @click=${(e) => { e.stopPropagation(); state.deleteVideo(v.path); }}></sl-icon-button>
+                        <sl-icon-button name="trash" class="delete-btn" label="Delete" @click=${(e) => { e.stopPropagation(); state.deleteVideo(v.path); }}></sl-icon-button>
                     </div>
                 </div>
             `)}
@@ -229,7 +229,7 @@ class AppRoot extends LitElement {
         <!-- Detail Column -->
         <div id="detail-col">
             ${this.currentVideo ? this.renderDetail() : html`
-                <div style="display:flex; justify-content:center; align-items:center; height:100%; color: #999;">
+                <div class="empty-state">
                     <p>Select a video to view</p>
                 </div>
             `}
@@ -258,10 +258,10 @@ class AppRoot extends LitElement {
 
         <div class="controls-bar">
              <sl-icon name="speedometer"></sl-icon>
-             <span style="font-size: 0.9rem; min-width: 60px;">${this.playbackSpeed}x</span>
-             <sl-range style="width: 200px;" min="0.5" max="10" step="0.5" .value=${this.playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
+             <span class="speed-label">${this.playbackSpeed}x</span>
+             <sl-range class="speed-slider" min="0.5" max="10" step="0.5" .value=${this.playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
 
-             <div style="flex:1;"></div>
+             <div class="spacer"></div>
 
              ${!isProcessed ? html`
                  <sl-button id="process-btn" variant="primary" @click=${() => state.processVideo(this.currentVideo)}>
