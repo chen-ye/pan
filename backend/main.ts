@@ -137,13 +137,13 @@ async function handler(req: Request): Promise<Response> {
 
   // Serve Frontend Static Files
   if (path === "/" || path === "/index.html") {
-    return serveFile(join(Deno.cwd(), "frontend/index.html"), "text/html");
+    return serveFile(join(Deno.cwd(), "frontend/dist/index.html"), "text/html");
   }
 
   // Serve other static files
   try {
-     const staticPath = join(Deno.cwd(), "frontend", path);
-     if (!staticPath.startsWith(join(Deno.cwd(), "frontend"))) {
+     const staticPath = join(Deno.cwd(), "frontend/dist", path);
+     if (!staticPath.startsWith(join(Deno.cwd(), "frontend/dist"))) {
         return new Response("Forbidden", { status: 403 });
      }
 

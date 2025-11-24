@@ -1,6 +1,6 @@
 
-import { LitElement, html, css } from "https://esm.sh/lit@3.1.2";
-import { Signal } from "https://esm.sh/signal-polyfill@0.1.0";
+import { LitElement, html, css } from "lit";
+import { Signal } from "signal-polyfill";
 
 class State {
   constructor() {

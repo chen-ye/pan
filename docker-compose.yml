@@ -1,10 +1,14 @@
 services:
   app:
-    image: denoland/deno:2.1.4
+    build:
+      context: .
+      dockerfile: Dockerfile.app
     working_dir: /app
     volumes:
       - .:/app
       - ./data:/data
+      - /app/frontend/node_modules
+      - /app/frontend/dist
     command: deno run --allow-net --allow-read --allow-write --allow-run --watch backend/main.ts
     ports:
       - "8000:8000"
