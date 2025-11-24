@@ -3,6 +3,12 @@ import { LitElement, html, css } from "lit";
 import { Signal } from "signal-polyfill";
 
 class State {
+  videos: any;
+  currentVideoPath: any;
+  currentResults: any;
+  playbackSpeed: any;
+  filterProcessed: any;
+
   constructor() {
     this.videos = new Signal.State([]);
     this.currentVideoPath = new Signal.State(null);
@@ -53,8 +59,8 @@ class State {
     }
   }
 
-  async processVideo(path) {
-      const btn = document.getElementById('process-btn');
+  async processVideo(path: string) {
+      const btn = document.getElementById('process-btn') as any;
       if(btn) btn.loading = true;
       try {
           const res = await fetch("/api/worker/process", {
@@ -81,6 +87,13 @@ class State {
 const state = new State();
 
 class AppRoot extends LitElement {
+  videoList: any[];
+  currentVideo: any;
+  results: any;
+  playbackSpeed: number;
+  interval: any;
+  animReq: any;
+
   constructor() {
     super();
     this.videoList = [];
@@ -138,11 +151,11 @@ class AppRoot extends LitElement {
   }
 
   drawOverlays() {
-      const video = this.querySelector('video');
-      const canvas = this.querySelector('#overlay-canvas');
+      const video = this.querySelector('video') as HTMLVideoElement;
+      const canvas = this.querySelector('#overlay-canvas') as HTMLCanvasElement;
       if (!video || !canvas || !this.results) return;
 
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d')!;
 
       // Match canvas size to video display size
       if (canvas.width !== video.clientWidth || canvas.height !== video.clientHeight) {
@@ -289,9 +302,9 @@ class AppRoot extends LitElement {
     e.target.playbackRate = this.playbackSpeed;
   }
 
-  setSpeed(speed) {
+  setSpeed(speed: any) {
     state.playbackSpeed.set(parseFloat(speed));
-    const video = this.querySelector('#main-video');
+    const video = this.querySelector('#main-video') as HTMLVideoElement;
     if (video) video.playbackRate = parseFloat(speed);
   }
 }

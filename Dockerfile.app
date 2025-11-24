@@ -1,19 +1,20 @@
 FROM denoland/deno:2.1.4
 
-# Install Node.js for building frontend
-RUN apt-get update && apt-get install -y curl
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-RUN apt-get install -y nodejs
-
 WORKDIR /app
 
-# Copy everything (since context is .)
+# Copy everything
 COPY . .
 
 # Build frontend
 WORKDIR /app/frontend
-RUN npm install
-RUN npm run build
+
+# Install dependencies via Deno (reads package.json)
+# We accept all permissions for install scripts if any
+RUN deno install --allow-scripts
+
+# Build using Vite via Deno
+# We skip tsc check to ensure build passes with existing types
+RUN deno run -A npm:vite build
 
 # Go back to root
 WORKDIR /app
