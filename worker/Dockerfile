@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download MegaDetector v5a
-RUN curl -L -o md_v5a.0.0.pt https://github.com/microsoft/CameraTraps/releases/download/v5.0/md_v5a.0.0.pt
+# Pre-download MegaDetector v1000 (Cedar)
+RUN curl -L -o md_v1000.pt https://huggingface.co/boquila/megadetector-v1000/resolve/main/MDv1000-cedar.bq
 
 COPY . .
 

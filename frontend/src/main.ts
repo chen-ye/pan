@@ -87,6 +87,210 @@ class State {
 const state = new State();
 
 class AppRoot extends LitElement {
+  static styles = css`
+    :host {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      font-family: var(--sl-font-sans);
+      --sidebar-width: 250px;
+      --list-width: 320px;
+    }
+
+    header {
+      background-color: #1a1a1a;
+      color: white;
+      padding: 0 var(--sl-spacing-medium);
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    h1 { margin: 0; font-size: 1.2rem; font-weight: 600; letter-spacing: 1px; }
+
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    #filters-col {
+      width: var(--sidebar-width);
+      border-right: 1px solid var(--sl-color-neutral-200);
+      background: var(--sl-color-neutral-50);
+      display: flex;
+      flex-direction: column;
+      padding: var(--sl-spacing-medium);
+      gap: var(--sl-spacing-medium);
+    }
+
+    #list-col {
+      width: var(--list-width);
+      border-right: 1px solid var(--sl-color-neutral-200);
+      background: var(--sl-color-neutral-0);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    #detail-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #f5f5f5;
+      position: relative;
+      overflow-y: auto;
+    }
+
+    .video-item {
+      padding: var(--sl-spacing-medium);
+      cursor: pointer;
+      border-bottom: 1px solid var(--sl-color-neutral-200);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: background 0.2s;
+    }
+
+    .video-item:hover {
+      background-color: var(--sl-color-neutral-100);
+    }
+
+    .video-item.active {
+      background-color: var(--sl-color-primary-50);
+      border-left: 4px solid var(--sl-color-primary-600);
+    }
+
+    .video-title {
+        font-weight: 500;
+        font-size: 0.9rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .video-meta {
+      font-size: 0.75rem;
+      color: var(--sl-color-neutral-500);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .video-container {
+        position: relative;
+        width: 100%;
+        background: black;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        flex-grow: 1;
+        min-height: 300px;
+    }
+
+    video {
+        max-width: 100%;
+        max-height: 100%;
+        display: block;
+    }
+
+    #overlay-canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+    }
+
+    .tag-container {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+    }
+
+    .tag {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        background: var(--sl-color-neutral-200);
+        color: var(--sl-color-neutral-700);
+    }
+
+    .tag.animal {
+        background: var(--sl-color-danger-100);
+        color: var(--sl-color-danger-700);
+        border: 1px solid var(--sl-color-danger-200);
+    }
+
+    .tag.processed {
+        background: var(--sl-color-success-100);
+        color: var(--sl-color-success-700);
+    }
+
+    .controls-bar {
+        background: white;
+        padding: var(--sl-spacing-medium);
+        border-top: 1px solid var(--sl-color-neutral-200);
+        display: flex;
+        gap: var(--sl-spacing-medium);
+        align-items: center;
+    }
+
+    .section-title {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--sl-color-neutral-500);
+        font-weight: 600;
+        margin-bottom: var(--sl-spacing-small);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .list-header {
+      padding: var(--sl-spacing-medium);
+    }
+
+    .delete-btn {
+      font-size: 1rem;
+    }
+
+    .empty-state {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100%;
+      color: #999;
+    }
+
+    .speed-label {
+      font-size: 0.9rem;
+      min-width: 60px;
+    }
+
+    .speed-slider {
+      width: 200px;
+    }
+
+    .spacer {
+      flex: 1;
+    }
+
+    .info-panel {
+        padding: var(--sl-spacing-medium);
+        background: white;
+        border-bottom: 1px solid var(--sl-color-neutral-200);
+    }
+  `;
+
   videoList: any[];
   currentVideo: any;
   results: any;
@@ -100,10 +304,6 @@ class AppRoot extends LitElement {
     this.currentVideo = null;
     this.results = null;
     this.playbackSpeed = 5.0;
-  }
-
-  createRenderRoot() {
-    return this;
   }
 
   connectedCallback() {
@@ -200,7 +400,7 @@ class AppRoot extends LitElement {
   render() {
     return html`
       <header>
-        <h1>ANIML NVR</h1>
+        <h1>Pan NVR</h1>
         <div class="header-actions">
              <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector v5</sl-button>
         </div>

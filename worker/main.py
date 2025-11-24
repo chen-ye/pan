@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Load Model
-MODEL_PATH = "md_v5a.0.0.pt"
+MODEL_PATH = "md_v1000.pt"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 logger.info(f"Loading model from {MODEL_PATH} on {device}...")
 

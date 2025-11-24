@@ -1,4 +1,4 @@
-# ANIML NVR
+# Pan NVR
 
 A Deno + Lit + Python/MegaDetector NVR application for browsing and analyzing wildlife camera trap videos.
 
