@@ -1,0 +1,22 @@
+services:
+  app:
+    image: denoland/deno:2.1.4
+    working_dir: /app
+    volumes:
+      - .:/app
+      - ./data:/data
+    command: deno run --allow-net --allow-read --allow-write --allow-run --watch backend/main.ts
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_DIR=/data
+      - WORKER_URL=http://worker:5000
+
+  worker:
+    build: ./worker
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
+    ports:
+      - "5000:5000"
