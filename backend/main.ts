@@ -1,7 +1,6 @@
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { join, extname, relative } from "https://deno.land/std@0.224.0/path/mod.ts";
-import { walk } from "https://deno.land/std@0.224.0/fs/walk.ts";
+import { join, extname, relative } from "@std/path";
+import { walk } from "@std/fs";
 
 const DATA_DIR = Deno.env.get("DATA_DIR") || "./data";
 const WORKER_URL = Deno.env.get("WORKER_URL") || "http://worker:5000";
@@ -24,27 +23,66 @@ async function handler(req: Request): Promise<Response> {
   // API Routes
   if (path === "/api/videos" && req.method === "GET") {
     try {
-      const videos = [];
+      const page = parseInt(url.searchParams.get("page") || "1");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const dirs = url.searchParams.getAll("dirs");
+
+      const allVideos = [];
       for await (const entry of walk(DATA_DIR)) {
         if (entry.isFile && isVideo(entry.name)) {
-           // Get relative path from DATA_DIR
-           const relPath = relative(DATA_DIR, entry.path);
-           // Check if processed
-           const jsonPath = entry.path + ".json";
+             const relPath = relative(DATA_DIR, entry.path);
+
+             if (dirs.length > 0) {
+                 const inDir = dirs.some(dir => relPath === dir || relPath.startsWith(dir + "/"));
+                 if (!inDir) continue;
+             }
+
+             allVideos.push({
+                 path: relPath,
+                 name: entry.name,
+                 fullPath: entry.path
+             });
+        }
+      }
+
+      // Sort
+      allVideos.sort((a, b) => a.name.localeCompare(b.name));
+
+      // Pagination
+      const total = allVideos.length;
+      const startIndex = (page - 1) * limit;
+      const endIndex = startIndex + limit;
+      const pageVideos = allVideos.slice(startIndex, endIndex);
+
+      const mappedVideos = [];
+      for (const v of pageVideos) {
+           const jsonPath = v.fullPath + ".json";
            let processed = false;
            try {
                await Deno.stat(jsonPath);
                processed = true;
            } catch {}
 
-           videos.push({
-               path: relPath,
-               name: entry.name,
-               processed: processed
+           let size = 0;
+           try {
+               const info = await Deno.stat(v.fullPath);
+               size = info.size;
+           } catch {}
+
+           mappedVideos.push({
+               path: v.path,
+               name: v.name,
+               processed: processed,
+               size: size
            });
-        }
       }
-      return new Response(JSON.stringify(videos), { headers: { ...Object.fromEntries(headers), "Content-Type": "application/json" } });
+
+      return new Response(JSON.stringify({
+          items: mappedVideos,
+          total: total,
+          page: page,
+          limit: limit
+      }), { headers: { ...Object.fromEntries(headers), "Content-Type": "application/json" } });
     } catch (e) {
       return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
     }
@@ -65,6 +103,17 @@ async function handler(req: Request): Promise<Response> {
     } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
     }
+    }
+
+
+  // Directory Tree
+  if (path === "/api/dirs" && req.method === "GET") {
+      try {
+          const tree = await getDirTree(DATA_DIR);
+          return new Response(JSON.stringify(tree), { headers: { ...Object.fromEntries(headers), "Content-Type": "application/json" } });
+      } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
+      }
   }
 
   // Serve Result JSON
@@ -159,6 +208,29 @@ async function handler(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404 });
 }
 
+interface TreeNode {
+    name: string;
+    path: string;
+    children: TreeNode[];
+}
+
+async function getDirTree(currentPath: string): Promise<TreeNode[]> {
+    const nodes: TreeNode[] = [];
+    for await (const entry of Deno.readDir(currentPath)) {
+        if (entry.isDirectory) {
+            const fullPath = join(currentPath, entry.name);
+            const relativePath = relative(DATA_DIR, fullPath);
+            nodes.push({
+                name: entry.name,
+                path: relativePath,
+                children: await getDirTree(fullPath)
+            });
+        }
+    }
+    nodes.sort((a, b) => a.name.localeCompare(b.name));
+    return nodes;
+}
+
 function isVideo(filename: string) {
     const ext = extname(filename).toLowerCase();
     return [".mp4", ".mov", ".avi", ".mkv", ".webm"].includes(ext);
@@ -187,5 +259,5 @@ async function serveFile(path: string, contentType: string) {
     }
 }
 
-console.log("Server running on http://localhost:8000");
-await serve(handler, { port: 8000 });
+console.log("Server running on http://0.0.0.0:8000");
+Deno.serve({ port: 8000, hostname: "0.0.0.0" }, handler);

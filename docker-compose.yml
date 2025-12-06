@@ -9,12 +9,26 @@ services:
       - /mnt/d/NVR/:/data
       - /app/frontend/node_modules
       - /app/frontend/dist
-    command: deno run --allow-net --allow-read --allow-write --allow-run --watch backend/main.ts
+    command: deno run --allow-net --allow-read --allow-write --allow-run --watch --allow-env backend/main.ts
     ports:
       - "8000:8000"
     environment:
       - DATA_DIR=/data
       - WORKER_URL=http://worker:5000
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    working_dir: /app/frontend
+    volumes:
+      - .:/app
+    command: deno run -A npm:vite --host
+    ports:
+      - "5173:5173"
+    depends_on:
+      - app
+    restart: unless-stopped
 
   worker:
     build: ./worker

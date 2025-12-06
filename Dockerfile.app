@@ -1,9 +1,13 @@
-FROM denoland/deno:2.1.4
+FROM denoland/deno:2.5.6
 
 WORKDIR /app
 
 # Copy everything
 COPY . .
+
+WORKDIR /app/backend
+# Install backend dependencies
+RUN deno install
 
 # Build frontend
 WORKDIR /app/frontend
@@ -21,4 +25,4 @@ WORKDIR /app
 
 EXPOSE 8000
 
-CMD ["deno", "run", "--allow-net", "--allow-read", "--allow-write", "--allow-run", "backend/main.ts"]
+CMD ["deno", "run", "--allow-net", "--allow-read", "--allow-write", "--allow-run", "--allow-env", "backend/main.ts"]

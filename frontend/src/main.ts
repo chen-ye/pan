@@ -1,114 +1,101 @@
 
-import { LitElement, html, css } from "lit";
-import { Signal } from "signal-polyfill";
-import type SlButton from "@shoelace-style/shoelace/dist/components/button/button.js";
+import { LitElement, css } from "lit";
+import { SignalWatcher, html } from "@lit-labs/signals";
 
-interface Video {
-  path: string;
-  name: string;
-  processed: boolean;
-}
+import "@shoelace-style/shoelace/dist/components/button/button.js";
 
-interface Detection {
-  category: string;
-  conf: number;
-  timestamp: number;
-  bbox: number[];
-}
+import "@shoelace-style/shoelace/dist/components/tree/tree.js";
 
-interface Result {
-  detections: Detection[];
-  metadata: {
-    width: number;
-    height: number;
-  };
-}
+import "@shoelace-style/shoelace/dist/components/tree-item/tree-item.js";
+import type SlTreeItem from "@shoelace-style/shoelace/dist/components/tree-item/tree-item.js";
+import "@shoelace-style/shoelace/dist/components/checkbox/checkbox.js";
+import "@shoelace-style/shoelace/dist/components/divider/divider.js";
+import "@shoelace-style/shoelace/dist/components/icon/icon.js";
+import "@shoelace-style/shoelace/dist/components/icon-button/icon-button.js";
+import "@shoelace-style/shoelace/dist/components/range/range.js";
+import "@shoelace-style/shoelace/dist/components/tag/tag.js";
+import { State } from "./state.ts";
+import type { TreeNode } from "./types.ts";
 
-class State {
-  videos: Signal.State<Video[]>;
-  currentVideoPath: Signal.State<string | null>;
-  currentResults: Signal.State<Result | null>;
-  playbackSpeed: Signal.State<number>;
-  filterProcessed: Signal.State<boolean>;
+class AppRoot extends SignalWatcher(LitElement) {
+
+  animReq: number | undefined;
+  state: State;
 
   constructor() {
-    this.videos = new Signal.State<Video[]>([]);
-    this.currentVideoPath = new Signal.State<string | null>(null);
-    this.currentResults = new Signal.State(null);
-    this.playbackSpeed = new Signal.State(5.0);
-    this.filterProcessed = new Signal.State(false);
+    super();
+    this.state = new State();
   }
 
-  async fetchVideos() {
-    try {
-      const res = await fetch("/api/videos");
-      const data = await res.json();
-      data.sort((a, b) => a.name.localeCompare(b.name));
-      this.videos.set(data);
-    } catch (e) {
-      console.error("Failed to fetch videos", e);
-    }
+  connectedCallback() {
+    super.connectedCallback();
+    this.state.fetchDirs();
+    this.state.loadVideos(true);
+
+    // Animation loop for canvas
+    this.animationLoop();
   }
 
-  async selectVideo(path: string) {
-    this.currentVideoPath.set(path);
-    this.currentResults.set(null);
-
-    // Find video object to check processed status immediately from list if possible
-    const videos = this.videos.get();
-    const vid = videos.find(v => v.path === path);
-
-    if (vid && vid.processed) {
-        try {
-            const res = await fetch(`/api/results/${path}`);
-            if (res.ok) {
-                const data = await res.json();
-                this.currentResults.set(data);
-            }
-        } catch (e) {
-            console.error("Failed to load results", e);
-        }
-    }
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    cancelAnimationFrame(this.animReq);
   }
 
-  async deleteVideo(path: string) {
-    if (!confirm(`Delete ${path}?`)) return;
-    await fetch(`/api/videos/${path}`, { method: 'DELETE' });
-    await this.fetchVideos();
-    if (this.currentVideoPath.get() === path) {
-        this.currentVideoPath.set(null);
-        this.currentResults.set(null);
-    }
+  animationLoop() {
+      this.drawOverlays();
+      this.animReq = requestAnimationFrame(() => this.animationLoop());
   }
 
-  async processVideo(path: string) {
-      const btn = document.getElementById('process-btn') as SlButton;
-      if(btn) btn.loading = true;
-      try {
-          const res = await fetch("/api/worker/process", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ path })
-          });
-          const data = await res.json();
-          if (data.error) throw new Error(data.error);
+  drawOverlays() {
+      const video = this.querySelector('video') as HTMLVideoElement;
+      const canvas = this.querySelector('#overlay-canvas') as HTMLCanvasElement;
+      if (!video || !canvas) return;
 
-          await this.fetchVideos();
-          // Reload results if this is current video
-          if (this.currentVideoPath.get() === path) {
-              await this.selectVideo(path);
-          }
-      } catch (e) {
-          alert("Processing failed: " + e.message);
-      } finally {
-          if(btn) btn.loading = false;
+      const results = this.state.currentResults.get();
+      if (!results) return;
+
+      const ctx = canvas.getContext('2d')!;
+
+      // Match canvas size to video display size
+      if (canvas.width !== video.clientWidth || canvas.height !== video.clientHeight) {
+          canvas.width = video.clientWidth;
+          canvas.height = video.clientHeight;
       }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const currentTime = video.currentTime;
+      // Find detections close to current time
+      // Assuming 30fps roughly if not provided, so 0.033s per frame.
+      // We look for detections within 0.1s.
+      const threshold = 0.1;
+
+      const detections = results.detections || [];
+      const currentDetections = detections.filter(d => Math.abs(d.timestamp - currentTime) < threshold);
+
+      currentDetections.forEach(d => {
+          const [x1, y1, x2, y2] = d.bbox; // normalized
+
+          const rx = x1 * canvas.width;
+          const ry = y1 * canvas.height;
+          const rw = (x2 - x1) * canvas.width;
+          const rh = (y2 - y1) * canvas.height;
+
+          // Draw Box
+          ctx.strokeStyle = '#f00';
+          if (d.category === 'animal') ctx.strokeStyle = '#e91e63'; // Pink for animal
+          if (d.category === 'person') ctx.strokeStyle = '#2196f3'; // Blue
+
+          ctx.lineWidth = 3;
+          ctx.strokeRect(rx, ry, rw, rh);
+
+          // Draw Label
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.font = '14px sans-serif';
+          ctx.fillText(`${d.category} ${(d.conf*100).toFixed(0)}%`, rx, ry - 5);
+      });
   }
-}
 
-const state = new State();
-
-class AppRoot extends LitElement {
   static styles = css`
     :host {
       display: flex;
@@ -120,8 +107,8 @@ class AppRoot extends LitElement {
     }
 
     header {
-      background-color: #1a1a1a;
-      color: white;
+      background-color: var(--sl-color-neutral-050);
+      color: var(--sl-color-neutral-950);
       padding: 0 var(--sl-spacing-medium);
       height: 60px;
       display: flex;
@@ -161,7 +148,7 @@ class AppRoot extends LitElement {
       flex: 1;
       display: flex;
       flex-direction: column;
-      background: #f5f5f5;
+      background: var(--sl-color-neutral-500);
       position: relative;
       overflow-y: auto;
     }
@@ -204,7 +191,7 @@ class AppRoot extends LitElement {
     .video-container {
         position: relative;
         width: 100%;
-        background: black;
+        background: var(--sl-color-neutral-1000);
         display: flex;
         justify-content: center;
         align-items: center;
@@ -254,7 +241,7 @@ class AppRoot extends LitElement {
     }
 
     .controls-bar {
-        background: white;
+        background: var(--sl-color-neutral-0);
         padding: var(--sl-spacing-medium);
         border-top: 1px solid var(--sl-color-neutral-200);
         display: flex;
@@ -279,6 +266,11 @@ class AppRoot extends LitElement {
 
     .list-header {
       padding: var(--sl-spacing-medium);
+      position: sticky;
+      top: 0;
+      background: var(--sl-color-neutral-0);
+      z-index: 1;
+      border-bottom: 1px solid var(--sl-color-neutral-200);
     }
 
     .delete-btn {
@@ -290,7 +282,6 @@ class AppRoot extends LitElement {
       justify-content: center;
       align-items: center;
       height: 100%;
-      color: #999;
     }
 
     .speed-label {
@@ -308,130 +299,39 @@ class AppRoot extends LitElement {
 
     .info-panel {
         padding: var(--sl-spacing-medium);
-        background: white;
+        background: var(--sl-color-neutral-0);
         border-bottom: 1px solid var(--sl-color-neutral-200);
     }
   `;
 
-  videoList: Video[];
-  currentVideo: string | null;
-  results: Result | null;
-  playbackSpeed: number;
-  interval: number | undefined;
-  animReq: number | undefined;
-
-  constructor() {
-    super();
-    this.videoList = [];
-    this.currentVideo = null;
-    this.results = null;
-    this.playbackSpeed = 5.0;
-  }
-
-  connectedCallback() {
-    super.connectedCallback();
-    state.fetchVideos();
-
-    this.interval = setInterval(() => {
-        const newVideos = state.videos.get();
-        if (JSON.stringify(newVideos) !== JSON.stringify(this.videoList)) {
-            this.videoList = newVideos;
-            this.requestUpdate();
-        }
-
-        const newCurrent = state.currentVideoPath.get();
-        if (newCurrent !== this.currentVideo) {
-            this.currentVideo = newCurrent;
-            this.requestUpdate();
-        }
-
-        const newResults = state.currentResults.get();
-        if (JSON.stringify(newResults) !== JSON.stringify(this.results)) {
-            this.results = newResults;
-        }
-
-        const newSpeed = state.playbackSpeed.get();
-        if (newSpeed !== this.playbackSpeed) {
-            this.playbackSpeed = newSpeed;
-            this.requestUpdate();
-        }
-    }, 200);
-
-    // Animation loop for canvas
-    this.animationLoop();
-  }
-
-  disconnectedCallback() {
-    super.disconnectedCallback();
-    clearInterval(this.interval);
-    cancelAnimationFrame(this.animReq);
-  }
-
-  animationLoop() {
-      this.drawOverlays();
-      this.animReq = requestAnimationFrame(() => this.animationLoop());
-  }
-
-  drawOverlays() {
-      const video = this.querySelector('video') as HTMLVideoElement;
-      const canvas = this.querySelector('#overlay-canvas') as HTMLCanvasElement;
-      if (!video || !canvas || !this.results) return;
-
-      const ctx = canvas.getContext('2d')!;
-
-      // Match canvas size to video display size
-      if (canvas.width !== video.clientWidth || canvas.height !== video.clientHeight) {
-          canvas.width = video.clientWidth;
-          canvas.height = video.clientHeight;
-      }
-
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      const currentTime = video.currentTime;
-      // Find detections close to current time
-      // Assuming 30fps roughly if not provided, so 0.033s per frame.
-      // We look for detections within 0.1s.
-      const threshold = 0.1;
-
-      const detections = this.results.detections || [];
-      const currentDetections = detections.filter(d => Math.abs(d.timestamp - currentTime) < threshold);
-
-      currentDetections.forEach(d => {
-          const [x1, y1, x2, y2] = d.bbox; // normalized
-
-          const rx = x1 * canvas.width;
-          const ry = y1 * canvas.height;
-          const rw = (x2 - x1) * canvas.width;
-          const rh = (y2 - y1) * canvas.height;
-
-          // Draw Box
-          ctx.strokeStyle = '#f00';
-          if (d.category === 'animal') ctx.strokeStyle = '#e91e63'; // Pink for animal
-          if (d.category === 'person') ctx.strokeStyle = '#2196f3'; // Blue
-
-          ctx.lineWidth = 3;
-          ctx.strokeRect(rx, ry, rw, rh);
-
-          // Draw Label
-          ctx.fillStyle = ctx.strokeStyle;
-          ctx.font = '14px sans-serif';
-          ctx.fillText(`${d.category} ${(d.conf*100).toFixed(0)}%`, rx, ry - 5);
-      });
-  }
-
   render() {
+    function formatSize(bytes: number) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
     return html`
       <header>
         <h1>Pan NVR</h1>
         <div class="header-actions">
-             <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector v5</sl-button>
+             <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector</sl-button>
         </div>
       </header>
       <main>
         <!-- Filters Column -->
         <div id="filters-col">
             <div class="section-title">Filters</div>
-            <sl-checkbox checked disabled>All Locations</sl-checkbox>
+
+            <div style="margin-bottom: 10px; font-size: 0.9rem; font-weight: 500;">Locations</div>
+            ${this.state.dirTree.get().length > 0 ? html`
+                <sl-tree selection="multiple" @sl-selection-change=${this.onTreeSelectionChange}>
+                    ${this.renderTreeItems(this.state.dirTree.get())}
+                </sl-tree>
+            ` : html`<div>${this.state.error.get() ? html`<span style="color:red">${this.state.error.get()}</span>` : 'Loading dirs...'}</div>`}
+
             <sl-divider></sl-divider>
             <div class="section-title">Classifications</div>
             <sl-checkbox checked>All</sl-checkbox>
@@ -445,25 +345,31 @@ class AppRoot extends LitElement {
 
         <!-- List Column -->
         <div id="list-col">
-            <div class="section-title list-header">Videos (${this.videoList.length})</div>
-            ${this.videoList.map(v => html`
-                <div class="video-item ${this.currentVideo === v.path ? 'active' : ''}" @click=${() => state.selectVideo(v.path)}>
+            <div class="section-title list-header">Videos (${this.state.totalVideos.get()})</div>
+            ${this.state.videos.get().map(v => html`
+                <div class="video-item ${this.state.currentVideoPath.get() === v.path ? 'active' : ''}" @click=${() => this.state.selectVideo(v.path)}>
                     <div class="video-title" title="${v.name}">${v.name}</div>
                     <div class="tag-container">
                         ${v.processed ? html`<span class="tag processed">Processed</span>` : ''}
-                        <!-- Mock tags for now until we scan all -->
+                        <span class="tag">${formatSize(v.size)}</span>
                     </div>
                     <div class="video-meta">
                         <span>Video</span>
-                        <sl-icon-button name="trash" class="delete-btn" label="Delete" @click=${(e) => { e.stopPropagation(); state.deleteVideo(v.path); }}></sl-icon-button>
+                        <sl-icon-button name="trash" class="delete-btn" label="Delete" @click=${(e) => { e.stopPropagation(); this.state.deleteVideo(v.path); }}></sl-icon-button>
                     </div>
                 </div>
             `)}
+
+            ${this.state.hasMore.get() ? html`
+                <div style="padding: 10px; text-align: center;">
+                    <sl-button variant="default" ?loading=${this.state.isLoading.get()} @click=${() => this.state.loadVideos()}>Load More</sl-button>
+                </div>
+            ` : ''}
         </div>
 
         <!-- Detail Column -->
         <div id="detail-col">
-            ${this.currentVideo ? this.renderDetail() : html`
+            ${this.state.currentVideoPath.get() ? this.renderDetail() : html`
                 <div class="empty-state">
                     <p>Select a video to view</p>
                 </div>
@@ -474,8 +380,12 @@ class AppRoot extends LitElement {
   }
 
   renderDetail() {
-      const vidData = this.videoList.find(v => v.path === this.currentVideo);
+      const currentPath = this.state.currentVideoPath.get();
+      const vidData = this.state.videos.get().find(v => v.path === currentPath);
       const isProcessed = vidData && vidData.processed;
+
+      const results = this.state.currentResults.get();
+      const playbackSpeed = this.state.playbackSpeed.get();
 
       return html`
         <div class="video-container">
@@ -485,7 +395,7 @@ class AppRoot extends LitElement {
                 autoplay
                 muted
                 loop
-                src="/videos/${this.currentVideo}"
+                src="/videos/${currentPath}"
                 @loadedmetadata=${this.onVideoLoad}
             ></video>
             <canvas id="overlay-canvas"></canvas>
@@ -493,41 +403,63 @@ class AppRoot extends LitElement {
 
         <div class="controls-bar">
              <sl-icon name="speedometer"></sl-icon>
-             <span class="speed-label">${this.playbackSpeed}x</span>
-             <sl-range class="speed-slider" min="0.5" max="10" step="0.5" .value=${this.playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
+             <span class="speed-label">${playbackSpeed}x</span>
+             <sl-range class="speed-slider" min="0.5" max="10" step="0.5" .value=${playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
 
              <div class="spacer"></div>
 
              ${!isProcessed ? html`
-                 <sl-button id="process-btn" variant="primary" @click=${() => state.processVideo(this.currentVideo)}>
+                 <sl-button id="process-btn" variant="primary" @click=${() => this.state.processVideo(currentPath)}>
                     <sl-icon slot="prefix" name="cpu"></sl-icon>
                     Process with AI
                  </sl-button>
              ` : html`
                  <sl-tag type="success">Processed</sl-tag>
-                 <sl-button size="small" @click=${() => state.processVideo(this.currentVideo)}>Re-process</sl-button>
+                 <sl-button size="small" @click=${() => this.state.processVideo(currentPath)}>Re-process</sl-button>
              `}
         </div>
 
         <div class="info-panel">
             <h3>Metadata</h3>
-            <p><strong>File:</strong> ${this.currentVideo}</p>
-            ${this.results ? html`
-                <p><strong>Detections:</strong> ${this.results.detections.length}</p>
-                <p><strong>Resolution:</strong> ${this.results.metadata.width}x${this.results.metadata.height}</p>
+            <p><strong>File:</strong> ${currentPath}</p>
+            ${results ? html`
+                <p><strong>Detections:</strong> ${results.detections.length}</p>
+                <p><strong>Resolution:</strong> ${results.metadata.width}x${results.metadata.height}</p>
             ` : ''}
         </div>
       `;
   }
 
   onVideoLoad(e) {
-    e.target.playbackRate = this.playbackSpeed;
+    e.target.playbackRate = this.state.playbackSpeed.get();
   }
 
   setSpeed(speed: string) {
-    state.playbackSpeed.set(parseFloat(speed));
+    this.state.playbackSpeed.set(parseFloat(speed));
     const video = this.querySelector('#main-video') as HTMLVideoElement;
     if (video) video.playbackRate = parseFloat(speed);
+  }
+  onTreeSelectionChange(e: Event) {
+      // SlTree emits sl-selection-change with detail.selection as SlTreeItem[]
+      const event = e as CustomEvent;
+      const selectedItems = event.detail.selection as SlTreeItem[];
+
+      const newSet = new Set<string>();
+      selectedItems.forEach(item => {
+            const path = item.getAttribute('value');
+            if (path) newSet.add(path);
+      });
+      this.state.selectedDirs.set(newSet);
+      this.state.loadVideos(true);
+  }
+
+  renderTreeItems(nodes: TreeNode[]) {
+      return nodes.map(node => html`
+          <sl-tree-item .selected=${this.state.selectedDirs.get().has(node.path)} value="${node.path}">
+              ${node.name}
+              ${node.children && node.children.length > 0 ? this.renderTreeItems(node.children) : ''}
+          </sl-tree-item>
+      `);
   }
 }
 

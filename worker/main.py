@@ -19,7 +19,12 @@ logger.info(f"Loading model from {MODEL_PATH} on {device}...")
 try:
     # Load custom model from local file using torch.hub
     # We use the ultralytics/yolov5 repo to load the custom weights
-    model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH)
+    try:
+        model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH)
+    except Exception as e:
+        logger.warning(f"Failed to load model from cache: {e}. Retrying with force_reload=True...")
+        model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH, force_reload=True)
+
     logger.info("Model loaded successfully.")
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
