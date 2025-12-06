@@ -51,7 +51,8 @@ export class State {
   gpuStats = signal<GpuStats | null>(null);
 
   constructor() {
-    const params = new URLSearchParams(globalThis.location.search);
+    const url = new URL(globalThis.location.href);
+    const params = url.searchParams;
     if (params.has("video")) this.currentVideoPath.set(params.get("video"));
     if (params.has("speed")) {
       this.playbackSpeed.set(parseFloat(params.get("speed")!));
@@ -59,9 +60,21 @@ export class State {
     if (params.has("processed")) {
       this.filterProcessed.set(params.get("processed") === "true");
     }
-    if (params.has("dirs")) {
-      const dirs = params.get("dirs")!.split(",");
-      this.selectedDirs.set(new Set(dirs));
+    if (params.has("processed")) {
+      this.filterProcessed.set(params.get("processed") === "true");
+    }
+
+    // Load dirs from sessionStorage
+    try {
+      const stored = sessionStorage.getItem("selectedDirs");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          this.selectedDirs.set(new Set(parsed));
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to load dirs from session", e);
     }
 
     // Auto-refresh library
@@ -126,11 +139,9 @@ export class State {
     const processed = this.filterProcessed.get();
     if (processed) params.set("processed", "true");
 
-    const dirs = Array.from(this.selectedDirs.get());
-    if (dirs.length > 0) params.set("dirs", dirs.join(","));
-
-    const newUrl = `${globalThis.location.pathname}?${params.toString()}`;
-    globalThis.history.replaceState({}, "", newUrl);
+    const url = new URL(globalThis.location.href);
+    url.search = params.toString();
+    globalThis.history.replaceState({}, "", url.toString());
   }
 
   setPlaybackSpeed(speed: number) {
@@ -146,8 +157,7 @@ export class State {
   async fetchDirs() {
     console.log("Fetching dirs...");
     this.error.set(null);
-    this.updateUrl();
-    this.updateUrl(); // Sync initial state to URL if needed (e.g. cleaning up empty params)
+    this.updateUrl(); // Sync initial state to URL if needed
     try {
       const res = await fetch("/api/dirs");
       if (!res.ok) throw new Error(`Status ${res.status}`);
@@ -172,14 +182,21 @@ export class State {
     try {
       const page = reset ? 1 : this.currentPage.get();
 
-      const selectedDirs = Array.from(this.selectedDirs.get());
-      const dirParams = selectedDirs.map((d: string) =>
-        `dirs=${encodeURIComponent(d)}`
-      ).join("&");
-      const query = `page=${page}&limit=50&sort=${this.sortBy.get()}&order=${this.sortOrder.get()}` +
-        (dirParams ? `&${dirParams}` : "");
+      const selectedDirs = this.minimizeDirs(Array.from(this.selectedDirs.get()));
 
-      const res = await fetch(`/api/videos?${query}`);
+      const payload = {
+        page: page,
+        limit: 50,
+        sort: this.sortBy.get(),
+        order: this.sortOrder.get(),
+        dirs: selectedDirs
+      };
+
+      const res = await fetch("/api/videos/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
       const data = await res.json() as VideosResponse;
 
       // Backend returns { items: [], total: ..., page: ..., limit: ... }
@@ -253,11 +270,19 @@ export class State {
     return data;
   }
 
+  resultsCache = new Map<string, Result>();
+
   async selectVideo(path: string) {
     this.currentVideoPath.set(path);
     this.currentResults.set(null);
     this.updateUrl();
-    this.updateUrl();
+
+    // Check cache first
+    if (this.resultsCache.has(path)) {
+      this.currentResults.set(this.resultsCache.get(path)!);
+      this.prefetchNeighbors(path);
+      return;
+    }
 
     // Find video object to check processed status immediately from list if possible
     const videos = this.videos.get();
@@ -270,17 +295,11 @@ export class State {
           try {
             let data = await res.json();
             data = this.normalizeLegacyFormat(data);
+            this.resultsCache.set(path, data);
             this.currentResults.set(data);
           } catch (e) {
-            // const text = await res.text();
             console.error("Failed to parse JSON results", e);
-            // We set a dummy error result or clear it to indicate corruption
-            // For now, we rely on the component checking for null if we want to show nothing
-            // But we should probably alert the user.
-            // A simple "Corrupted Result" toast would be nice, but for now let's just not set it
             this.currentResults.set(null);
-            // In a real app we might want to store "resultError" state
-            // and show "Results corrupted, please re-process" in the UI
             this.error.set(`Result file corrupted for ${path}: ${e instanceof Error ? e.message : String(e)}`);
             setTimeout(() => this.error.set(null), 5000);
           }
@@ -288,6 +307,41 @@ export class State {
       } catch (e) {
         console.error("Failed to load results", e);
       }
+    }
+
+    this.prefetchNeighbors(path);
+  }
+
+  prefetchNeighbors(currentPath: string) {
+    const videos = this.videos.get();
+    const idx = videos.findIndex(v => v.path === currentPath);
+    if (idx === -1) return;
+
+    if (idx > 0) {
+        this.prefetchResult(videos[idx - 1].path);
+    }
+    if (idx < videos.length - 1) {
+        this.prefetchResult(videos[idx + 1].path);
+    }
+  }
+
+  async prefetchResult(path: string) {
+    if (this.resultsCache.has(path)) return; // Already cached
+
+    // Check if processed
+    const videos = this.videos.get();
+    const vid = videos.find(v => v.path === path);
+    if (!vid || !vid.processed) return;
+
+    try {
+        const res = await fetch(`/api/results/${path}`);
+        if (res.ok) {
+            let data = await res.json();
+            data = this.normalizeLegacyFormat(data);
+            this.resultsCache.set(path, data);
+        }
+    } catch {
+        // Ignore prefetch errors
     }
   }
 
@@ -316,7 +370,6 @@ export class State {
         this.currentVideoPath.set(null);
         this.currentResults.set(null);
         this.updateUrl();
-        this.updateUrl();
       }
     }
   }
@@ -330,6 +383,7 @@ export class State {
       next.delete(path);
     }
     this.selectedDirs.set(next);
+    sessionStorage.setItem("selectedDirs", JSON.stringify(Array.from(next)));
     this.updateUrl();
     this.loadVideos(true);
   }
@@ -571,5 +625,28 @@ export class State {
     } catch (e: unknown) {
       alert("Move failed: " + (e instanceof Error ? e.message : String(e)));
     }
+  }
+
+  minimizeDirs(dirs: string[]): string[] {
+    if (dirs.length === 0) return [];
+
+    // Sort to ensure parents come before children
+    // e.g. ["/a", "/a/b", "/b"]
+    const sorted = [...dirs].sort();
+
+    const result: string[] = [];
+
+    for (const dir of sorted) {
+      // Check if this dir is covered by the last added dir
+      if (result.length > 0) {
+        const last = result[result.length - 1];
+        if (dir.startsWith(last + "/") || dir === last) {
+          continue;
+        }
+      }
+      result.push(dir);
+    }
+
+    return result;
   }
 }

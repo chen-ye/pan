@@ -288,6 +288,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
               autoplay
               muted
               loop
+              preload="metadata"
               crossorigin="anonymous"
               src="/videos/${currentPath}"
               @loadedmetadata="${this.onVideoLoad}"

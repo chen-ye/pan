@@ -10,18 +10,28 @@ import { getDirTree } from "./services/files.ts";
 export const router = new Router();
 
 // 1. Get Videos
-router.get("/api/videos", async (ctx) => {
-  const page = parseInt(ctx.request.url.searchParams.get("page") || "1");
-  const limit = parseInt(ctx.request.url.searchParams.get("limit") || "50");
-  const dirs = ctx.request.url.searchParams.getAll("dirs");
-  const sortBy = ctx.request.url.searchParams.get("sort") || "name"; // name, size, date
-  const order = ctx.request.url.searchParams.get("order") || "asc"; // asc, desc
+// 1. Get Videos (Search)
+router.post("/api/videos/search", async (ctx) => {
+  let body: any = {};
+  try {
+    if (ctx.request.hasBody) {
+        body = await ctx.request.body.json();
+    }
+  } catch {
+    // Empty body is fine, use defaults
+  }
+
+  const page = parseInt(body.page || "1");
+  const limit = parseInt(body.limit || "50");
+  const dirs = Array.isArray(body.dirs) ? body.dirs : []; // Expect array of strings
+  const sortBy = body.sort || "name";
+  const order = body.order || "asc";
 
   let filteredVideos = libraryService.getVideos();
 
   if (dirs.length > 0) {
     filteredVideos = filteredVideos.filter((v) => {
-      return dirs.some((dir) => v.path === dir || v.path.startsWith(dir + "/"));
+      return dirs.some((dir: string) => v.path === dir || v.path.startsWith(dir + "/"));
     });
   }
 
@@ -59,10 +69,6 @@ router.get("/api/videos", async (ctx) => {
             processed = info.size > 0;
         } catch { /* File doesn't exist */ }
     }
-
-    // Size is now in v.size, but let's trust the one we have to avoid extra syscall,
-    // or re-stat if we want to be super fresh. Library refresh is async so might be slightly stale.
-    // For listing, cached size is fine.
 
     return {
       path: v.path,
@@ -246,6 +252,7 @@ router.get("/videos/:path*", async (ctx) => {
     return;
   }
   try {
+    // Do not use Oak.send, but directly stream the file. Oak.send seems to have issues with large files.
     const fullPath = join(CONFIG.DATA_DIR, videoPath);
     const file = await Deno.open(fullPath, { read: true });
     const fileInfo = await file.stat();
