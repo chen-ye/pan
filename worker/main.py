@@ -29,22 +29,32 @@ except Exception as e:
 
 DATA_DIR = "/data"
 
-# MD Class mapping
+# MD Class mapping - MegaDetector uses numeric class IDs
+# MDv5: 1=animal, 2=person, 3=vehicle
+# MDv1000 may use different IDs, so we'll be flexible
 CLASS_MAPPING = {
+    1: 'animal',
+    2: 'person',
+    3: 'vehicle',
     '1': 'animal',
     '2': 'person',
-    '3': 'vehicle'
+    '3': 'vehicle',
 }
 
-def process_video_file(rel_path):
+from flask import Response, stream_with_context
+
+def process_video_generator(rel_path):
     if model is None:
-        return {"error": "Model not loaded"}
+        yield json.dumps({"error": "Model not loaded"}) + "\n"
+        return
 
     video_path = os.path.join(DATA_DIR, rel_path)
     if not os.path.exists(video_path):
-        return {"error": "File not found"}
+        yield json.dumps({"error": "File not found"}) + "\n"
+        return
 
     logger.info(f"Processing {video_path}...")
+    yield json.dumps({"status": "starting", "path": video_path}) + "\n"
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -54,16 +64,20 @@ def process_video_file(rel_path):
 
     results_list = []
 
-    # Process 2 frames per second
+    # Process every 2 frames
     if fps > 0:
-        frame_interval = int(fps / 2)
+        frame_interval = int(fps / 4)
     else:
-        frame_interval = 30 # Fallback
+        frame_interval = 30
 
     if frame_interval < 1:
         frame_interval = 1
 
     frame_count = 0
+    processed_count = 0
+
+    # Estimate total processed frames for progress
+    est_total_processed = total_frames / frame_interval
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -71,30 +85,49 @@ def process_video_file(rel_path):
             break
 
         if frame_count % frame_interval == 0:
-            # Conversion to PIL for MegaDetector
+            # Conversion to PIL
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(frame_rgb)
 
             # Inference
             result = model.generate_detections_one_image(pil_img)
 
-            # result['detections'] is a list of dicts: {'category': '1', 'conf': 0.9, 'bbox': [x, y, w, h]}
-            for d in result['detections']:
-                if d['conf'] > 0.2:
-                    cat_id = d['category']
-                    class_name = CLASS_MAPPING.get(cat_id, str(cat_id))
+            # Handle case where model returns None (e.g., invalid image)
+            if result and 'detections' in result and result['detections']:
+                for d in result['detections']:
+                    if d['conf'] > 0.2:
+                        cat_id = d['category']
 
-                    # Convert [x, y, w, h] to [x1, y1, x2, y2]
-                    x, y, w, h = d['bbox']
-                    bbox = [x, y, x + w, y + h]
+                        # Skip detections with invalid/unreasonable class IDs
+                       # MegaDetector should only return 1, 2, or 3
+                        if isinstance(cat_id, int) and cat_id > 10:
+                            continue
+                        if isinstance(cat_id, str) and not cat_id.isdigit():
+                            continue
+                        if isinstance(cat_id, str) and int(cat_id) > 10:
+                            continue
 
-                    results_list.append({
-                        "frame": frame_count,
-                        "timestamp": frame_count / fps if fps > 0 else 0,
-                        "category": class_name,
-                        "conf": d['conf'],
-                        "bbox": bbox
-                    })
+                        class_name = CLASS_MAPPING.get(cat_id, f'unknown_{cat_id}')
+                        x, y, w, h = d['bbox']
+                        bbox = [x, y, x + w, y + h]
+
+                        results_list.append({
+                            "frame": frame_count,
+                            "timestamp": frame_count / fps if fps > 0 else 0,
+                            "category": class_name,
+                            "conf": d['conf'],
+                            "bbox": bbox
+                        })
+
+            processed_count += 1
+            # Emit progress on every processed frame for real-time updates
+            progress = min(processed_count / est_total_processed, 1.0)
+            yield json.dumps({
+                "status": "progress",
+                "progress": progress,
+                "frame": frame_count,
+                "total_frames": total_frames
+            }) + "\n"
 
         frame_count += 1
 
@@ -115,15 +148,14 @@ def process_video_file(rel_path):
                 "detections": results_list
             }, f, indent=2)
         logger.info(f"Saved results to {json_path}")
+        yield json.dumps({
+            "status": "complete",
+            "output": json_path,
+            "detections_count": len(results_list)
+        }) + "\n"
     except Exception as e:
         logger.error(f"Failed to save JSON: {e}")
-        return {"error": "Failed to save results"}
-
-    return {
-        "status": "complete",
-        "output": json_path,
-        "detections_count": len(results_list)
-    }
+        yield json.dumps({"error": "Failed to save results"}) + "\n"
 
 @app.route('/process', methods=['POST'])
 def handle_process():
@@ -132,13 +164,17 @@ def handle_process():
     if not path:
         return jsonify({"error": "No path provided"}), 400
 
-    try:
-        # In a real app, this should be async/queued
-        res = process_video_file(path)
-        return jsonify(res)
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        return jsonify({"error": str(e)}), 500
+    def generate():
+        for chunk in process_video_generator(path):
+            yield chunk
+            # Force flush to ensure immediate streaming
+            import sys
+            sys.stdout.flush()
+
+    response = Response(stream_with_context(generate()), mimetype='application/x-ndjson')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 @app.route('/status', methods=['GET'])
 def status():
@@ -147,6 +183,20 @@ def status():
         "device": device if 'device' in globals() else "cuda",
         "model": MODEL_VERSION
     })
+
+@app.route('/stats', methods=['GET'])
+def handle_stats():
+    stats = {}
+    if torch.cuda.is_available():
+        stats['gpu_name'] = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info(0)
+        stats['memory_free'] = free
+        stats['memory_total'] = total
+        stats['memory_used'] = total - free
+    else:
+        stats['error'] = "No CUDA device found"
+
+    return jsonify(stats)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

@@ -15,8 +15,10 @@ export class State {
   totalVideos = signal(0);
 
   dirTree = signal<TreeNode[]>([]);
-  selectedDirs = signal(new Set());
+  selectedDirs = signal<Set<string>>(new Set());
   error = signal<string | null>(null);
+
+  gpuStats = signal<any>(null);
 
   constructor() {
       const params = new URLSearchParams(window.location.search);
@@ -34,6 +36,18 @@ export class State {
           console.log("Library update received, reloading...");
           this.loadVideos(true);
       });
+
+      // Poll GPU stats
+      setInterval(async () => {
+          try {
+              const res = await fetch("/api/worker/stats");
+              if (res.ok) {
+                  this.gpuStats.set(await res.json());
+              }
+          } catch {}
+      }, 5000);
+      // Initial fetch
+      fetch("/api/worker/stats").then(r => r.ok && r.json()).then(d => d && this.gpuStats.set(d)).catch(() => {});
   }
 
   updateUrl() {
@@ -82,6 +96,12 @@ export class State {
       }
   }
 
+  durationCache = new Map<string, number>();
+
+
+
+  // ...
+
   async loadVideos(reset = false) {
     if (this.isLoading.get()) return;
     this.isLoading.set(true);
@@ -98,6 +118,13 @@ export class State {
 
       // Backend returns { items: [], total: ..., page: ..., limit: ... }
       const newItems = data.items;
+
+      // Apply cached durations
+      newItems.forEach((item: Video) => {
+          if (item.duration === undefined && this.durationCache.has(item.path)) {
+              item.duration = this.durationCache.get(item.path);
+          }
+      });
 
       if (reset) {
           this.videos.set(newItems);
@@ -120,6 +147,46 @@ export class State {
     }
   }
 
+  normalizeLegacyFormat(data: any): any {
+      // Check if data has legacy format (annotations array)
+      if (data.annotations && Array.isArray(data.annotations)) {
+          console.log("Converting legacy format to new format");
+          const detections: any[] = [];
+
+          data.annotations.forEach((ann: any) => {
+              const frameNum = parseInt(ann.img_id || "0");
+              const bboxes = ann.bbox || [];
+              const categories = ann.category || [];
+              const confidences = ann.confidence || [];
+
+              // Each frame can have multiple detections
+              for (let i = 0; i < bboxes.length; i++) {
+                  detections.push({
+                      frame: frameNum,
+                      timestamp: frameNum / 2, // Assume 2fps processing
+                      category: categories[i] || "unknown",
+                      conf: confidences[i] || 0,
+                      bbox: bboxes[i] || [0, 0, 0, 0]
+                  });
+              }
+          });
+
+          return {
+              video: data.video || "unknown",
+              metadata: data.metadata || {
+                  fps: 2,
+                  total_frames: data.annotations.length,
+                  width: 1920,
+                  height: 1080
+              },
+              detections: detections
+          };
+      }
+
+      // Already in new format
+      return data;
+  }
+
   async selectVideo(path: string) {
     this.currentVideoPath.set(path);
     this.currentResults.set(null);
@@ -134,7 +201,8 @@ export class State {
         try {
             const res = await fetch(`/api/results/${path}`);
             if (res.ok) {
-                const data = await res.json();
+                let data = await res.json();
+                data = this.normalizeLegacyFormat(data);
                 this.currentResults.set(data);
             }
         } catch (e) {
@@ -145,14 +213,32 @@ export class State {
 
   async deleteVideo(path: string) {
     if (!confirm(`Delete ${path}?`)) return;
+
+    // Calculate next video before deletion
+    const videos = this.videos.get();
+    const idx = videos.findIndex(v => v.path === path);
+    let nextPath: string | null = null;
+    if (idx !== -1) {
+        if (idx < videos.length - 1) {
+            nextPath = videos[idx + 1].path;
+        } else if (idx > 0) {
+            nextPath = videos[idx - 1].path;
+        }
+    }
+
     await fetch(`/api/videos/${path}`, { method: 'DELETE' });
     await this.loadVideos(true);
+
     if (this.currentVideoPath.get() === path) {
-        this.currentVideoPath.set(null);
-        this.currentResults.set(null);
+        if (nextPath) {
+            this.selectVideo(nextPath);
+        } else {
+            this.currentVideoPath.set(null);
+            this.currentResults.set(null);
+            this.updateUrl();
+            this.updateUrl();
+        }
     }
-    this.updateUrl();
-    this.updateUrl();
   }
 
   toggleDir(path: string, selected: boolean) {
@@ -169,27 +255,130 @@ export class State {
       this.loadVideos(true);
   }
 
-  async processVideo(path: string) {
+  selectNextVideo() {
+      const videos = this.videos.get();
+      const current = this.currentVideoPath.get();
+      if (!current && videos.length > 0) {
+          this.selectVideo(videos[0].path);
+          return;
+      }
+      const idx = videos.findIndex(v => v.path === current);
+      if (idx !== -1 && idx < videos.length - 1) {
+          this.selectVideo(videos[idx + 1].path);
+      }
+  }
+
+  selectPrevVideo() {
+      const videos = this.videos.get();
+      const current = this.currentVideoPath.get();
+       if (!current && videos.length > 0) {
+          this.selectVideo(videos[0].path);
+          return;
+      }
+      const idx = videos.findIndex(v => v.path === current);
+      if (idx > 0) {
+          this.selectVideo(videos[idx - 1].path);
+      }
+  }
+
+  processingJob = signal<{ path: string; progress: number; status: string } | null>(null);
+  processingQueue = signal<string[]>([]);
+  isBatchProcessing = signal(false);
+
+  // ...
+
+  async processBatch() {
+      if (this.isBatchProcessing.get()) return;
+      this.isBatchProcessing.set(true);
+
+      const videos = this.videos.get();
+      // Filter for unprocessed videos
+      const queue = videos.filter(v => !v.processed).map(v => v.path);
+
+      if (queue.length === 0) {
+          alert("No unprocessed videos to process.");
+          this.isBatchProcessing.set(false);
+          return;
+      }
+
+      this.processingQueue.set(queue);
+      await this.processQueueLoop();
+      this.isBatchProcessing.set(false);
+  }
+
+  async processQueueLoop() {
+      while (this.processingQueue.get().length > 0) {
+          const queue = this.processingQueue.get();
+          const nextPath = queue[0];
+
+          await this.processVideo(nextPath, true);
+
+          // Remove from queue
+          this.processingQueue.set(this.processingQueue.get().slice(1));
+      }
+  }
+
+  async processVideo(path: string, isBatch = false) {
+      if (this.processingJob.get() && !isBatch) return; // Busy
+
       const btn = document.getElementById('process-btn') as SlButton;
-      if(btn) btn.loading = true;
+      if(btn && !isBatch) btn.loading = true;
+
+      this.processingJob.set({ path, progress: 0, status: "Starting..." });
+
       try {
-          const res = await fetch("/api/worker/process", {
+           const res = await fetch("/api/worker/process", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ path })
           });
-          const data = await res.json();
-          if (data.error) throw new Error(data.error);
 
-          // Just reload all for simplicity to update processed status
-          await this.loadVideos(true);
-          // Reload results if this is current video
-          if (this.currentVideoPath.get() === path) {
-              await this.selectVideo(path);
+          const reader = res.body?.getReader();
+          if (!reader) throw new Error("No readable stream");
+
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || ""; // Keep last partial line
+
+              for (const line of lines) {
+                  if (!line.trim()) continue;
+                  try {
+                      const msg = JSON.parse(line);
+                      if (msg.error) throw new Error(msg.error);
+
+                      if (msg.status === "progress") {
+                          this.processingJob.set({ path, progress: msg.progress, status: `Processing frame ${msg.frame}/${msg.total_frames}` });
+                      } else if (msg.status === "complete") {
+                          this.processingJob.set({ path, progress: 1, status: "Complete" });
+                      } else if (msg.status === "starting") {
+                           this.processingJob.set({ path, progress: 0, status: "Starting..." });
+                      }
+                  } catch (e) {
+                      console.error("JSON parse error", e);
+                  }
+              }
           }
+
+           // Reload list to update status
+          await this.loadVideos(true);
+
+          // If this was the current video, reload its results
+          if (this.currentVideoPath.get() === path) {
+              await this.selectVideo(path); // This fetches results
+          }
+
       } catch (e: any) {
-          alert("Processing failed: " + e.message);
+          if (!isBatch) alert("Processing failed: " + e.message);
+          console.error(`Processing failed for ${path}:`, e);
       } finally {
+          this.processingJob.set(null);
           if(btn) btn.loading = false;
       }
   }
@@ -210,6 +399,11 @@ export class State {
               const currentList = this.videos.get();
               // Create a map for faster lookup
               const durationMap = new Map(Object.entries(data));
+
+              // Update cache
+              for (const [path, dur] of durationMap.entries()) {
+                   this.durationCache.set(path, Number(dur));
+              }
 
               const updatedList = currentList.map(v => {
                   if (durationMap.has(v.path)) {
