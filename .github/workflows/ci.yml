@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Start Services
+        run: |
+          docker compose up -d --build
+
+      - name: Wait for services
+        run: |
+          # Simple wait for frontend to be ready (rudimentary check)
+          # In real internal CI, we might use a dedicated wait script
+          sleep 30
+
+      - name: Install Test Dependencies
+        run: docker compose exec -T tests npm install
+
+      - name: Lint Code
+        run: |
+          docker compose exec -T app deno task lint
+          # Frontend linting might need deno installed in the tests container or run via host if available?
+          # Actually, 'app' container has deno. accessible via volume?
+          # Easier: Frontend is mounted in app container too?
+          # app container mounts .:/app, so /app/frontend exists there.
+          docker compose exec -T app sh -c "cd frontend && deno task lint"
+
+          docker compose exec -T app sh -c "cd frontend && deno task lint"
+
+      - name: Check Formatting
+        run: docker compose exec -T app deno fmt --check
+
+      - name: Run Frontend/E2E Tests
+        run: docker compose exec -T tests npm test
+
+      - name: Run Backend Tests
+        run: docker compose exec -T app deno task test
+
+      - name: Teardown
+        if: always()
+        run: docker compose down

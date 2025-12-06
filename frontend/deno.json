@@ -10,5 +10,13 @@
     "rules": {
       "exclude": ["no-window"]
     }
+  },
+  "tasks": {
+    "lint": "deno lint"
+  },
+  "fmt": {
+    "options": {
+      "singleQuote": true
+    }
   }
 }

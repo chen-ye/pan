@@ -665,6 +665,10 @@
     }
   },
   "workspace": {
+    "dependencies": [
+      "npm:vite-plugin-static-copy@^2.3.0",
+      "npm:vite@^7.2.6"
+    ],
     "packageJson": {
       "dependencies": [
         "npm:@lit-labs/signals@~0.1.3",

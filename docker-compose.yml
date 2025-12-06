@@ -46,3 +46,14 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  tests:
+    image: mcr.microsoft.com/playwright:v1.50.1-noble
+    working_dir: /app/tests
+    volumes:
+      - .:/app
+    depends_on:
+      - app
+      - frontend
+    ipc: host
+    command: sh -c "npm install && tail -f /dev/null"

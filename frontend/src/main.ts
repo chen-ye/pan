@@ -1,13 +1,13 @@
-import { LitElement, css } from "lit";
-import { SignalWatcher, html } from "@lit-labs/signals";
+import { css, LitElement } from "lit";
+import { html, SignalWatcher } from "@lit-labs/signals";
 import { State } from "./state.ts";
-import { setBasePath } from '@shoelace-style/shoelace/dist/utilities/base-path.js';
+import { setBasePath } from "@shoelace-style/shoelace/dist/utilities/base-path.js";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "./components/filter-panel.ts";
 import "./components/video-list.ts";
 import "./components/video-detail.ts";
 
-setBasePath('/shoelace');
+setBasePath("/shoelace");
 
 class AppRoot extends SignalWatcher(LitElement) {
   state: State;
@@ -23,27 +23,30 @@ class AppRoot extends SignalWatcher(LitElement) {
 
   handleKeyDown = (e: KeyboardEvent) => {
     const target = e.target as HTMLElement;
-    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+    if (
+      target.tagName === "INPUT" || target.tagName === "TEXTAREA" ||
+      target.isContentEditable
+    ) return;
 
-    if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        this.state.selectNextVideo();
-    } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        this.state.selectPrevVideo();
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      this.state.selectNextVideo();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      this.state.selectPrevVideo();
     }
-  }
+  };
 
   override connectedCallback() {
     super.connectedCallback();
     this.state.fetchDirs();
     this.state.loadVideos(true);
-    globalThis.addEventListener('keydown', this.handleKeyDown);
+    globalThis.addEventListener("keydown", this.handleKeyDown);
   }
 
   override disconnectedCallback() {
     super.disconnectedCallback();
-    globalThis.removeEventListener('keydown', this.handleKeyDown);
+    globalThis.removeEventListener("keydown", this.handleKeyDown);
   }
 
   static override styles = css`
@@ -67,7 +70,12 @@ class AppRoot extends SignalWatcher(LitElement) {
       flex-shrink: 0;
     }
 
-    h1 { margin: 0; font-size: 1.2rem; font-weight: 600; letter-spacing: 1px; }
+    h1 {
+      margin: 0;
+      font-size: 1.2rem;
+      font-weight: 600;
+      letter-spacing: 1px;
+    }
 
     main {
       flex: 1;
@@ -174,7 +182,7 @@ class AppRoot extends SignalWatcher(LitElement) {
       left: 0;
       right: 0;
       bottom: 0;
-      background: rgba(0,0,0,0.5);
+      background: rgba(0, 0, 0, 0.5);
       z-index: 100;
     }
     .filter-overlay.open {
@@ -206,62 +214,94 @@ class AppRoot extends SignalWatcher(LitElement) {
 
   override render() {
     function formatSize(bytes: number) {
-        if (bytes === 0) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
     }
     const gpu = this.state.gpuStats.get();
 
     return html`
       <header>
         <div style="display: flex; align-items: center; gap: 10px;">
-            <sl-icon-button class="mobile-filter-btn" name="funnel" label="Filters" @click=${() => this.toggleFilters()}></sl-icon-button>
-            <h1>Pan NVR</h1>
+          <sl-icon-button
+            class="mobile-filter-btn"
+            name="funnel"
+            label="Filters"
+            @click="${() => this.toggleFilters()}"
+          ></sl-icon-button>
+          <h1>Pan NVR</h1>
         </div>
         <div class="header-actions">
-             ${gpu ? html`
-                 <div style="font-size: 0.8rem; color: var(--sl-color-neutral-600); margin-right: 15px;">
-                    ${gpu.error ? html`<span style="color: var(--sl-color-danger-600)">GPU Error: ${gpu.error}</span>` :
-                    html`
-                        <span>${gpu.gpu_name}</span>
-                        <span style="margin-left: 8px;">${gpu.utilization !== undefined ? `${gpu.utilization}% GPU` : ''}</span>
-                        <span style="margin-left: 8px;">${formatSize(gpu.memory_used ?? 0)} / ${formatSize(gpu.memory_total ?? 0)}</span>
-                    `}
-                 </div>
-             ` : ''}
-             <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector</sl-button>
+          ${gpu
+            ? html`
+              <div
+                style="font-size: 0.8rem; color: var(--sl-color-neutral-600); margin-right: 15px;"
+              >
+                ${gpu.error
+                  ? html`
+                    <span style="color: var(--sl-color-danger-600)">GPU Error: ${gpu
+                      .error}</span>
+                  `
+                  : html`
+                    <span>${gpu.gpu_name}</span>
+                    <span style="margin-left: 8px;">${gpu.utilization !==
+                        undefined
+                      ? `${gpu.utilization}% GPU`
+                      : ""}</span>
+                    <span style="margin-left: 8px;">${formatSize(
+                      gpu.memory_used ?? 0,
+                    )} / ${formatSize(gpu.memory_total ?? 0)}</span>
+                  `}
+              </div>
+            `
+            : ""}
+          <sl-button
+            size="small"
+            variant="neutral"
+            href="https://github.com/microsoft/CameraTraps"
+            target="_blank"
+          >MegaDetector</sl-button>
         </div>
       </header>
 
       <!-- Mobile Filter Drawer -->
-      <div class="filter-overlay ${this.state.showFilters.get() ? 'open' : ''}" @click=${() => this.toggleFilters()}></div>
-      <div class="filter-drawer ${this.state.showFilters.get() ? 'open' : ''}">
-          <div class="filter-drawer-header">
-              <h3 style="margin: 0;">Filters</h3>
-              <sl-icon-button name="x-lg" label="Close" @click=${() => this.toggleFilters()}></sl-icon-button>
-          </div>
-          <filter-panel .state=${this.state}></filter-panel>
+      <div class="filter-overlay ${this.state.showFilters.get()
+        ? "open"
+        : ""}" @click="${() => this.toggleFilters()}"></div>
+      <div class="filter-drawer ${this.state.showFilters.get() ? "open" : ""}">
+        <div class="filter-drawer-header">
+          <h3 style="margin: 0;">Filters</h3>
+          <sl-icon-button
+            name="x-lg"
+            label="Close"
+            @click="${() => this.toggleFilters()}"
+          ></sl-icon-button>
+        </div>
+        <filter-panel .state="${this.state}"></filter-panel>
       </div>
       <main>
         <!-- Filters Column -->
         <div id="filters-col">
-            <filter-panel .state=${this.state}></filter-panel>
+          <filter-panel .state="${this.state}"></filter-panel>
         </div>
 
         <!-- List Column -->
         <div id="list-col">
-            <video-list .state=${this.state}></video-list>
+          <video-list .state="${this.state}"></video-list>
         </div>
 
         <!-- Detail Column -->
         <div id="detail-col">
-            <video-detail .state=${this.state}></video-detail>
+          <video-detail .state="${this.state}"></video-detail>
         </div>
       </main>
     `;
   }
 }
 
-customElements.define('app-root', AppRoot as unknown as CustomElementConstructor);
+customElements.define(
+  "app-root",
+  AppRoot as unknown as CustomElementConstructor,
+);
