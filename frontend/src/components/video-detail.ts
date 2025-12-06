@@ -1,6 +1,7 @@
 import { css, html, LitElement } from "lit";
 import { SignalWatcher } from "@lit-labs/signals";
 import { State } from "../state.ts";
+import type { Detection } from "../types.ts";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "@shoelace-style/shoelace/dist/components/icon/icon.js";
 import "@shoelace-style/shoelace/dist/components/range/range.js";
@@ -36,27 +37,42 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     .video-container {
       position: relative;
       width: 100%;
+      height: 100%;
       display: flex;
       justify-content: center;
       align-items: center;
       flex-grow: 1;
       min-height: 300px;
       background: #000;
+      overflow: hidden;
+    }
+    /* Grid wrapper ensures canvas patches video element exactly */
+    .media-stack {
+      display: grid;
+      place-items: center;
+      max-width: 100%;
+      max-height: 100%;
+      position: relative;
+    }
+    .media-stack > * {
+      grid-area: 1 / 1;
     }
     video {
       max-width: 100%;
       max-height: 100%;
       display: block;
+      /* Ensure the element shrinks to fit content aspect ratio */
+      width: auto;
+      height: auto;
     }
     #overlay-canvas {
-      position: absolute;
-      top: 0;
-      left: 0;
       width: 100%;
       height: 100%;
       pointer-events: none;
+      z-index: 10;
     }
     .controls-bar {
+      /* ... existing styles */
       background: var(--sl-color-neutral-0);
       padding: var(--sl-spacing-medium);
       border-top: 1px solid var(--sl-color-neutral-200);
@@ -265,19 +281,20 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
     return html`
       <div class="video-container">
-        <video
-          id="main-video"
-          controls
-          autoplay
-          muted
-          loop
-          crossorigin="anonymous"
-          src="${window.location.protocol}//${window.location
-            .hostname}:8000/videos/${currentPath}"
-          @loadedmetadata="${this.onVideoLoad}"
-        >
-        </video>
-        <canvas id="overlay-canvas"></canvas>
+        <div class="media-stack">
+            <video
+              id="main-video"
+              controls
+              autoplay
+              muted
+              loop
+              crossorigin="anonymous"
+              src="/videos/${currentPath}"
+              @loadedmetadata="${this.onVideoLoad}"
+            >
+            </video>
+            <canvas id="overlay-canvas"></canvas>
+        </div>
       </div>
 
       <div class="controls-bar">
@@ -386,22 +403,16 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
   async generateThumbnails() {
     const results = this.state.currentResults.get();
-    const video = this.shadowRoot?.querySelector(
-      "#main-video",
-    ) as HTMLVideoElement;
-    const gallery = this.shadowRoot?.querySelector(
-      "#thumbnail-gallery",
-    ) as HTMLElement;
+    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
+    const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery") as HTMLElement;
 
     if (!results || !video || !gallery) return;
 
-    gallery.innerHTML =
-      '<p style="text-align:center; padding:10px;">Generating thumbnails...</p>';
+    gallery.innerHTML = '<p style="text-align:center; padding:10px;">Generating thumbnails...</p>';
 
     // Get unique detections (limit to first 20 for performance)
     const uniqueDetections = results.detections.slice(0, 20);
-
-    const thumbnails: string[] = [];
+    const thumbnails: { url: string; det: Detection }[] = [];
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d")!;
 
@@ -410,43 +421,63 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     video.pause();
     const originalTime = video.currentTime;
 
-    for (const det of uniqueDetections) {
-      await new Promise<void>((resolve) => {
-        video.currentTime = det.timestamp;
-        video.onseeked = () => {
-          // Calculate crop (normalized bbox to pixels)
-          const [x1, y1, x2, y2] = det.bbox;
-          const vw = video.videoWidth;
-          const vh = video.videoHeight;
+    try {
+      for (const det of uniqueDetections) {
+        try {
+            await new Promise<void>((resolve, reject) => {
+              const timeout = setTimeout(() => reject(new Error("Seek timeout")), 2000);
 
-          // Padding could be added here, but strictly following "detection area"
-          const sx = Math.max(0, Math.floor(x1 * vw));
-          const sy = Math.max(0, Math.floor(y1 * vh));
-          const sw = Math.min(vw - sx, Math.ceil((x2 - x1) * vw));
-          const sh = Math.min(vh - sy, Math.ceil((y2 - y1) * vh));
+              const onSeeked = () => {
+                clearTimeout(timeout);
+                resolve();
+              };
 
-          if (sw > 0 && sh > 0) {
-            canvas.width = sw;
-            canvas.height = sh;
+              video.addEventListener("seeked", onSeeked, { once: true });
+              video.currentTime = det.timestamp;
+            });
 
-            // Draw cropped area
-            ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+            // Calculate crop (normalized bbox to pixels)
+            const [x1, y1, x2, y2] = det.bbox;
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
 
-            thumbnails.push(canvas.toDataURL("image/jpeg", 0.7));
-          }
-          resolve();
-        };
+            const sx = Math.max(0, Math.floor(x1 * vw));
+            const sy = Math.max(0, Math.floor(y1 * vh));
+            const sw = Math.min(vw - sx, Math.ceil((x2 - x1) * vw));
+            const sh = Math.min(vh - sy, Math.ceil((y2 - y1) * vh));
+
+            if (sw > 0 && sh > 0) {
+              canvas.width = sw;
+              canvas.height = sh;
+              ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+              thumbnails.push({ url: canvas.toDataURL("image/jpeg", 0.7), det });
+            }
+        } catch (e) {
+            console.warn(`Failed to generate thumbnail for frame ${det.frame}:`, e);
+        }
+      }
+    } catch (e) {
+      console.error("Thumbnail generation failed:", e);
+      gallery.innerHTML = `<p style="color:var(--sl-color-danger-600); text-align:center;">Failed to generate thumbnails: ${e instanceof Error ? e.message : String(e)}</p>`;
+      return;
+    } finally {
+      // Restore video state
+      video.currentTime = originalTime;
+      // Wait for seek to complete before playing to avoid jumping
+      await new Promise<void>(r => {
+          video.addEventListener("seeked", () => r(), { once: true });
       });
+      if (wasPlaying) video.play();
     }
-
-    // Restore video state
-    video.currentTime = originalTime;
-    if (wasPlaying) video.play();
 
     // Render thumbnails
     gallery.innerHTML = "";
-    thumbnails.forEach((dataUrl, idx) => {
-      const det = uniqueDetections[idx];
+    if (thumbnails.length === 0) {
+        gallery.innerHTML = '<p style="text-align:center;">No thumbnails could be generated.</p>';
+        return;
+    }
+
+    thumbnails.forEach(({ url, det }) => {
       const item = document.createElement("div");
       item.className = "thumbnail-item";
       item.onclick = () => {
@@ -455,14 +486,12 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       };
 
       const img = document.createElement("img");
-      img.src = dataUrl;
+      img.src = url;
       img.alt = `${det.category} detection`;
 
       const label = document.createElement("div");
       label.className = "thumbnail-label";
-      label.textContent = `${det.category} ${(det.conf * 100).toFixed(0)}% @ ${
-        det.timestamp.toFixed(1)
-      }s`;
+      label.textContent = `${det.category} ${(det.conf * 100).toFixed(0)}% @ ${det.timestamp.toFixed(1)}s`;
 
       item.appendChild(img);
       item.appendChild(label);

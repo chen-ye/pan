@@ -55,6 +55,12 @@ class AppRoot extends SignalWatcher(LitElement) {
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       this.state.selectPrevVideo();
+    } else if (e.key === "Backspace" || e.key === "Delete") {
+      const current = this.state.currentVideoPath.get();
+      if (current) {
+        e.preventDefault();
+        this.state.deleteVideo(current);
+      }
     }
   };
 

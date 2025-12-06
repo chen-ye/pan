@@ -12,6 +12,40 @@ class ProcessingService {
   private currentJob: ProcessingJob | null = null;
   private isProcessing = false;
 
+  constructor() {
+    this.loadQueue();
+  }
+
+  private get queuePath() {
+    return CONFIG.DATA_DIR + "/.queue.json";
+  }
+
+  private async loadQueue() {
+    try {
+      const data = await Deno.readTextFile(this.queuePath);
+      const loaded = JSON.parse(data);
+      if (Array.isArray(loaded)) {
+        this.queue = loaded;
+        console.log(`Loaded ${this.queue.length} items from queue persistence.`);
+
+        // Resume processing if queue has items and we aren't processing
+        if (this.queue.length > 0 && !this.isProcessing) {
+             this.processNextInQueue();
+        }
+      }
+    } catch {
+      // Ignore missing file
+    }
+  }
+
+  private async saveQueue() {
+    try {
+      await Deno.writeTextFile(this.queuePath, JSON.stringify(this.queue));
+    } catch (e) {
+      console.error("Failed to save queue persistence:", e);
+    }
+  }
+
   getStatus() {
     return {
       currentJob: this.currentJob,
@@ -30,6 +64,7 @@ class ProcessingService {
 
     if (uniquePaths.length > 0) {
         this.queue.push(...uniquePaths);
+        this.saveQueue(); // Persist
         if (!this.isProcessing) {
             this.processNextInQueue();
         }
@@ -44,6 +79,7 @@ class ProcessingService {
 
   clearQueue() {
     this.queue = [];
+    this.saveQueue(); // Persist
     return { success: true };
   }
 
@@ -57,6 +93,7 @@ class ProcessingService {
 
     this.isProcessing = true;
     const path = this.queue.shift()!;
+    this.saveQueue(); // Persist removal
 
     // Check if file still exists
     try {

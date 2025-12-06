@@ -1,4 +1,4 @@
-import { Router, send } from "@oak/oak";
+import { Router } from "@oak/oak";
 import { join } from "@std/path";
 import { CONFIG } from "./config.ts";
 import { libraryService } from "./services/library.ts";
@@ -50,13 +50,13 @@ router.get("/api/videos", async (ctx) => {
     let processed = false;
     try {
       // Check if .json file exists
-      await Deno.stat(jsonPath);
-      processed = true;
+      const info = await Deno.stat(jsonPath);
+      processed = info.size > 0;
     } catch {
         // Try legacy format (video.json instead of video.mp4.json)
         try {
-            await Deno.stat(legacyJsonPath);
-            processed = true;
+            const info = await Deno.stat(legacyJsonPath);
+            processed = info.size > 0;
         } catch { /* File doesn't exist */ }
     }
 
@@ -145,9 +145,14 @@ router.post("/api/videos/durations", async (ctx) => {
   const results: Record<string, number | undefined> = {};
   await Promise.all(paths.map(async (p: string) => {
     if (!p || p.includes("..")) return;
-    const fullPath = join(CONFIG.DATA_DIR, p);
-    const duration = await metadataService.getDuration(fullPath);
-    results[p] = duration;
+    try {
+        const fullPath = join(CONFIG.DATA_DIR, p);
+        const duration = await metadataService.getDuration(fullPath);
+        results[p] = duration;
+    } catch (e) {
+        console.error(`Failed to get duration for ${p}:`, e);
+        results[p] = 0; // Or omit to indicate failure
+    }
   }));
   ctx.response.body = results;
 });
@@ -165,24 +170,40 @@ router.get("/api/results/:path*", async (ctx) => {
     ctx.throw(400, "Invalid path");
     return;
   }
-  try {
-    await send(ctx, resultPath + ".json", { root: CONFIG.DATA_DIR });
-  } catch {
-    // Try legacy path (replace extension with .json)
-    try {
-        const ext = resultPath.substring(resultPath.lastIndexOf("."));
-        const legacyPath = resultPath.substring(0, resultPath.lastIndexOf("."));
-        // Ensure we are replacing a valid video extension to avoid weird matches
-        if ([".mp4", ".mov", ".avi", ".mkv", ".webm"].includes(ext.toLowerCase())) {
-             await send(ctx, legacyPath + ".json", { root: CONFIG.DATA_DIR });
-             return;
-        }
-        throw new Error("Not found");
-    } catch {
-        ctx.response.status = 404;
-        ctx.response.body = { error: "Result not found" };
-    }
+
+  const tryServe = async (path: string) => {
+      const fullPath = join(CONFIG.DATA_DIR, path);
+      try {
+          const info = await Deno.stat(fullPath);
+          if (info.size === 0) throw new Error("File empty");
+
+          // Optional: Verify valid JSON (expensive for large files but requested)
+          // For now, let's just trust valid size, or maybe read first byte?
+          // If the user says "syntax error", the file has content but is bad.
+          // Let's try to parse it. It's safe for most result files.
+          const text = await Deno.readTextFile(fullPath);
+          JSON.parse(text); // Will throw if invalid
+
+          ctx.response.body = text;
+          ctx.response.type = "application/json";
+          return true;
+      } catch {
+          return false;
+      }
+  };
+
+  // Try standard path
+  if (await tryServe(resultPath + ".json")) return;
+
+  // Try legacy path
+  const ext = resultPath.substring(resultPath.lastIndexOf("."));
+  const legacyPath = resultPath.substring(0, resultPath.lastIndexOf("."));
+  if ([".mp4", ".mov", ".avi", ".mkv", ".webm"].includes(ext.toLowerCase())) {
+     if (await tryServe(legacyPath + ".json")) return;
   }
+
+  ctx.response.status = 404;
+  ctx.response.body = { error: "Result not found or corrupt" };
 });
 
 // 7. Proxy Worker
@@ -228,9 +249,83 @@ router.get("/videos/:path*", async (ctx) => {
     const fullPath = join(CONFIG.DATA_DIR, videoPath);
     const file = await Deno.open(fullPath, { read: true });
     const fileInfo = await file.stat();
-    ctx.response.body = file;
-    ctx.response.type = "video/mp4";
-    ctx.response.headers.set("Content-Length", fileInfo.size.toString());
+    const fileSize = fileInfo.size;
+
+    const range = ctx.request.headers.get("Range");
+
+    // Handle Range Requests (Seeking)
+    if (range) {
+        const bytes = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(bytes[0], 10);
+        const end = bytes[1] ? parseInt(bytes[1], 10) : fileSize - 1;
+        const chunkSize = (end - start) + 1;
+
+        await file.seek(start, Deno.SeekMode.Start);
+
+        ctx.response.status = 206;
+        ctx.response.headers.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+        ctx.response.headers.set("Accept-Ranges", "bytes");
+        ctx.response.headers.set("Content-Length", chunkSize.toString());
+        ctx.response.type = "video/mp4";
+
+        // Create a limited stream for the chunk
+        // We can't just pass 'file' because it would read to EOF
+        // We use a ReadableStream to control exactly how many bytes are sent
+        const stream = new ReadableStream({
+            async start(controller) {
+                const buf = new Uint8Array(16 * 1024); // 16KB chunks
+                let remaining = chunkSize;
+                try {
+                    while (remaining > 0) {
+                        const readSize = Math.min(buf.length, remaining);
+                        // We can't use file.read() easily with a buffer that size?
+                        // Actually Deno.read reads UP TO buf.length
+                        const n = await file.read(buf.subarray(0, readSize));
+                        if (n === null || n === 0) break;
+
+                        controller.enqueue(buf.slice(0, n));
+                        remaining -= n;
+                    }
+                    controller.close();
+                } catch (e) {
+                    controller.error(e);
+                } finally {
+                    file.close();
+                }
+            },
+            cancel() {
+                file.close();
+            }
+        });
+
+        ctx.response.body = stream;
+    } else {
+        // No Range, send whole file (but allows caching/seeking later if client supports)
+        ctx.response.status = 200;
+        ctx.response.headers.set("Content-Length", fileSize.toString());
+        ctx.response.headers.set("Accept-Ranges", "bytes");
+        ctx.response.type = "video/mp4";
+        // Just stream the whole file, simplest way
+        // But we need to ensure close happens. Oak handles FsFile closing usually?
+        // Let's use the stream approach for consistency to guarantee closure
+        const stream = new ReadableStream({
+            async start(controller) {
+                const buf = new Uint8Array(32 * 1024);
+                try {
+                   while (true) {
+                       const n = await file.read(buf);
+                       if (n === null || n === 0) break;
+                       controller.enqueue(buf.slice(0, n));
+                   }
+                   controller.close();
+                } catch(e) { console.error(e); controller.error(e); }
+                finally { file.close(); }
+            },
+            cancel() { file.close(); }
+        });
+        ctx.response.body = stream;
+    }
+
     ctx.response.headers.set("Access-Control-Allow-Origin", "*");
   } catch {
     ctx.response.status = 404;

@@ -267,9 +267,23 @@ export class State {
       try {
         const res = await fetch(`/api/results/${path}`);
         if (res.ok) {
-          let data = await res.json();
-          data = this.normalizeLegacyFormat(data);
-          this.currentResults.set(data);
+          try {
+            let data = await res.json();
+            data = this.normalizeLegacyFormat(data);
+            this.currentResults.set(data);
+          } catch (e) {
+            // const text = await res.text();
+            console.error("Failed to parse JSON results", e);
+            // We set a dummy error result or clear it to indicate corruption
+            // For now, we rely on the component checking for null if we want to show nothing
+            // But we should probably alert the user.
+            // A simple "Corrupted Result" toast would be nice, but for now let's just not set it
+            this.currentResults.set(null);
+            // In a real app we might want to store "resultError" state
+            // and show "Results corrupted, please re-process" in the UI
+            this.error.set(`Result file corrupted for ${path}: ${e instanceof Error ? e.message : String(e)}`);
+            setTimeout(() => this.error.set(null), 5000);
+          }
         }
       } catch (e) {
         console.error("Failed to load results", e);
