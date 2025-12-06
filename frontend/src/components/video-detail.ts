@@ -19,11 +19,11 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     state!: State;
     animReq: number | undefined;
 
-    static properties = {
+    static override properties = {
         state: { attribute: false }
     };
 
-    static styles = css`
+    static override styles = [css`
     :host {
       display: flex;
       flex-direction: column;
@@ -160,14 +160,14 @@ export class VideoDetail extends SignalWatcher(LitElement) {
             grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
         }
     }
-    `;
+    `];
 
-    connectedCallback() {
+    override connectedCallback() {
         super.connectedCallback();
         this.animationLoop();
     }
 
-    disconnectedCallback() {
+    override disconnectedCallback() {
         super.disconnectedCallback();
         if (this.animReq) cancelAnimationFrame(this.animReq);
     }
@@ -230,7 +230,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
         });
     }
 
-    render() {
+    override render() {
         if (!this.state) return html``;
         const currentPath = this.state.currentVideoPath.get();
 
@@ -270,7 +270,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
           <div class="controls-bar">
                <sl-icon name="speedometer"></sl-icon>
                <span class="speed-label">${playbackSpeed}x</span>
-               <sl-range class="speed-slider" min="0.5" max="18" step="0.5" .value=${playbackSpeed} @sl-change=${(e: any) => this.setSpeed(e.target.value)}></sl-range>
+               <sl-range class="speed-slider" min="0.5" max="18" step="0.5" .value=${playbackSpeed} @sl-change=${(e: Event) => this.setSpeed((e.target as HTMLInputElement).value)}></sl-range>
 
                <div class="spacer"></div>
 

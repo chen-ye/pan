@@ -23,11 +23,11 @@ function formatSize(bytes: number) {
 export class VideoList extends SignalWatcher(LitElement) {
     state!: State;
 
-    static properties = {
+    static override properties = {
         state: { attribute: false }
     };
 
-    static styles = css`
+    static override styles = [css`
     :host {
       display: flex;
       flex-direction: column;
@@ -125,9 +125,13 @@ export class VideoList extends SignalWatcher(LitElement) {
             font-size: 0.7rem;
         }
     }
-    `;
+    `];
 
-    render() {
+    override connectedCallback() {
+        super.connectedCallback();
+    }
+
+    override render() {
         if (!this.state) return html``;
 
         return html`

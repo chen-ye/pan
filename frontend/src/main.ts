@@ -34,19 +34,19 @@ class AppRoot extends SignalWatcher(LitElement) {
     }
   }
 
-  connectedCallback() {
+  override connectedCallback() {
     super.connectedCallback();
     this.state.fetchDirs();
     this.state.loadVideos(true);
     globalThis.addEventListener('keydown', this.handleKeyDown);
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback() {
     super.disconnectedCallback();
     globalThis.removeEventListener('keydown', this.handleKeyDown);
   }
 
-  static styles = css`
+  static override styles = css`
     :host {
       display: flex;
       flex-direction: column;
@@ -204,7 +204,7 @@ class AppRoot extends SignalWatcher(LitElement) {
     }
   `;
 
-  render() {
+  override render() {
     function formatSize(bytes: number) {
         if (bytes === 0) return '0 B';
         const k = 1024;
@@ -227,7 +227,7 @@ class AppRoot extends SignalWatcher(LitElement) {
                     html`
                         <span>${gpu.gpu_name}</span>
                         <span style="margin-left: 8px;">${gpu.utilization !== undefined ? `${gpu.utilization}% GPU` : ''}</span>
-                        <span style="margin-left: 8px;">${formatSize(gpu.memory_used)} / ${formatSize(gpu.memory_total)}</span>
+                        <span style="margin-left: 8px;">${formatSize(gpu.memory_used ?? 0)} / ${formatSize(gpu.memory_total ?? 0)}</span>
                     `}
                  </div>
              ` : ''}

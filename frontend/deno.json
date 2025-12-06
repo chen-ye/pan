@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "lib": ["deno.window", "dom", "esnext"]
+  },
+  "imports": {
+    "vite": "npm:vite@^7.2.6",
+    "vite-plugin-static-copy": "npm:vite-plugin-static-copy@^2.3.0"
+  },
+  "lint": {
+    "rules": {
+      "exclude": ["no-window"]
+    }
+  }
+}
