@@ -4,7 +4,6 @@ import cv2
 import os
 import json
 import logging
-from PIL import Image
 from megadetector.detection import run_detector
 from megadetector.visualization import visualization_utils as vis_utils
 
@@ -63,7 +62,7 @@ def process_video_generator(rel_path):
 
     results_list = []
 
-    # Process every 2 frames
+    # Process every 4th frame (approx 3-8 fps depending on source)
     if fps > 0:
         frame_interval = int(fps / 4)
     else:
@@ -74,9 +73,11 @@ def process_video_generator(rel_path):
 
     frame_count = 0
     processed_count = 0
-
-    # Estimate total processed frames for progress
     est_total_processed = total_frames / frame_interval
+
+    BATCH_SIZE = 8
+    batch_images = [] # List of numpy arrays (RGB)
+    batch_indices = [] # List of frame numbers
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -84,49 +85,97 @@ def process_video_generator(rel_path):
             break
 
         if frame_count % frame_interval == 0:
-            # Conversion to PIL
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame_rgb)
+            # Resize using OpenCV (Bilinear) - Much faster than PIL Lanczos
+            # Target width 1280 (MDv5 standard max dim)
+            target_size = 1280
+            h, w = frame.shape[:2]
+            max_dim = max(h, w)
 
-            # Resize to 640px (model expected input size) while maintaining aspect ratio
-            max_dim = max(pil_img.size)
-            if max_dim > 1280:
-                scale = 1280 / max_dim
-                new_size = (int(pil_img.size[0] * scale), int(pil_img.size[1] * scale))
-                pil_img = pil_img.resize(new_size, Image.LANCZOS)
+            if max_dim > target_size:
+                scale = target_size / max_dim
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                frame_resized = frame
 
-            # Inference
-            result = model.generate_detections_one_image(pil_img)
+            # Convert to RGB
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
-            # Handle case where model returns None (e.g., invalid image)
-            if result and 'detections' in result and result['detections']:
-                for d in result['detections']:
+            batch_images.append(frame_rgb)
+            batch_indices.append(frame_count)
+
+            # Process Batch
+            if len(batch_images) >= BATCH_SIZE:
+                # Run inference on batch
+                # generate_detections_one_batch expects list of images and list of IDs
+                batch_results = model.generate_detections_one_batch(batch_images, batch_indices)
+
+                for res in batch_results:
+                    frame_num = int(res['file']) # We used frame_count as ID
+
+                    if res['detections']:
+                        for d in res['detections']:
+                            if d['conf'] > 0.2:
+                                cat_id = d['category']
+                                class_name = CLASS_MAPPING.get(cat_id, f'unknown_{cat_id}')
+                                x, y, w, h = d['bbox']
+                                bbox = [x, y, x + w, y + h]
+
+                                results_list.append({
+                                    "frame": frame_num,
+                                    "timestamp": frame_num / fps if fps > 0 else 0,
+                                    "category": class_name,
+                                    "conf": d['conf'],
+                                    "bbox": bbox
+                                })
+
+                    processed_count += 1
+
+                # Emit result
+                progress = min(processed_count / est_total_processed, 1.0)
+                yield json.dumps({
+                    "status": "progress",
+                    "progress": progress,
+                    "frame": batch_indices[-1],
+                    "total_frames": total_frames
+                }) + "\n"
+
+                # Clear batch
+                batch_images = []
+                batch_indices = []
+
+        frame_count += 1
+
+    # Process remaining frames in batch
+    if len(batch_images) > 0:
+        batch_results = model.generate_detections_one_batch(batch_images, batch_indices)
+        for res in batch_results:
+            frame_num = int(res['file'])
+            if res['detections']:
+                for d in res['detections']:
                     if d['conf'] > 0.2:
                         cat_id = d['category']
-                        # Map known classes, label unknown ones for visibility
                         class_name = CLASS_MAPPING.get(cat_id, f'unknown_{cat_id}')
                         x, y, w, h = d['bbox']
                         bbox = [x, y, x + w, y + h]
-
                         results_list.append({
-                            "frame": frame_count,
-                            "timestamp": frame_count / fps if fps > 0 else 0,
+                            "frame": frame_num,
+                            "timestamp": frame_num / fps if fps > 0 else 0,
                             "category": class_name,
                             "conf": d['conf'],
                             "bbox": bbox
                         })
-
             processed_count += 1
-            # Emit progress on every processed frame for real-time updates
-            progress = min(processed_count / est_total_processed, 1.0)
-            yield json.dumps({
-                "status": "progress",
-                "progress": progress,
-                "frame": frame_count,
-                "total_frames": total_frames
-            }) + "\n"
 
-        frame_count += 1
+        progress = min(processed_count / est_total_processed, 1.0)
+        yield json.dumps({
+            "status": "progress",
+            "progress": progress,
+            "frame": batch_indices[-1],
+            "total_frames": total_frames
+        }) + "\n"
+
 
     cap.release()
 

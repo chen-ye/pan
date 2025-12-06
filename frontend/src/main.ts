@@ -5,7 +5,10 @@ import { setBasePath } from "@shoelace-style/shoelace/dist/utilities/base-path.j
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "./components/filter-panel.ts";
 import "./components/video-list.ts";
+import "./components/filter-panel.ts";
+import "./components/video-list.ts";
 import "./components/video-detail.ts";
+import "@shoelace-style/shoelace/dist/components/split-panel/split-panel.js";
 
 setBasePath("/shoelace");
 
@@ -15,6 +18,22 @@ class AppRoot extends SignalWatcher(LitElement) {
   constructor() {
     super();
     this.state = new State();
+    this.checkMobile();
+    globalThis.addEventListener("resize", this.handleResize);
+  }
+
+  isMobile = false;
+
+  handleResize = () => {
+    this.checkMobile();
+  };
+
+  checkMobile() {
+    const isMobile = globalThis.matchMedia("(max-width: 768px)").matches;
+    if (this.isMobile !== isMobile) {
+      this.isMobile = isMobile;
+      this.requestUpdate();
+    }
   }
 
   toggleFilters() {
@@ -47,6 +66,7 @@ class AppRoot extends SignalWatcher(LitElement) {
   override disconnectedCallback() {
     super.disconnectedCallback();
     globalThis.removeEventListener("keydown", this.handleKeyDown);
+    globalThis.removeEventListener("resize", this.handleResize);
   }
 
   static override styles = css`
@@ -98,6 +118,8 @@ class AppRoot extends SignalWatcher(LitElement) {
       background: var(--sl-color-neutral-50);
       display: flex;
       flex-direction: column;
+      height: 100%;
+      overflow-y: auto;
     }
 
     #detail-col {
@@ -105,7 +127,20 @@ class AppRoot extends SignalWatcher(LitElement) {
       display: flex;
       flex-direction: column;
       background: var(--sl-color-neutral-200);
+      height: 100%; /* Ensure full height for split panel content */
+      overflow: hidden;
     }
+
+    sl-split-panel {
+      --divider-width: 2px;
+      --min: 200px;
+
+      height: 100%;
+    }
+
+    /* Target specific panels for scroll modification if needed,
+       but generally panels handle their own scrolling */
+
 
     .header-actions {
       display: flex;
@@ -282,20 +317,37 @@ class AppRoot extends SignalWatcher(LitElement) {
         <filter-panel .state="${this.state}"></filter-panel>
       </div>
       <main>
-        <!-- Filters Column -->
-        <div id="filters-col">
-          <filter-panel .state="${this.state}"></filter-panel>
-        </div>
-
-        <!-- List Column -->
+        ${this.isMobile
+          ? html`
+        <!-- Mobile Layout -->
         <div id="list-col">
           <video-list .state="${this.state}"></video-list>
         </div>
-
-        <!-- Detail Column -->
         <div id="detail-col">
           <video-detail .state="${this.state}"></video-detail>
         </div>
+        `
+          : html`
+        <!-- Desktop Layout with Split Panels -->
+        <!-- Outer split: Filters vs (List + Detail) -->
+        <sl-split-panel position-in-pixels="250" primary="start">
+          <div slot="start" id="filters-col" style="height: 100%; width: 100%;">
+            <filter-panel .state="${this.state}"></filter-panel>
+          </div>
+
+          <div slot="end" style="height: 100%; display: flex; flex-direction: column; overflow: hidden;">
+             <!-- Inner split: List vs Detail -->
+             <sl-split-panel position-in-pixels="320" primary="start">
+               <div slot="start" id="list-col" style="height: 100%; width: 100%; border-right: none;">
+                  <video-list .state="${this.state}"></video-list>
+               </div>
+               <div slot="end" id="detail-col" style="height: 100%; width: 100%;">
+                  <video-detail .state="${this.state}"></video-detail>
+               </div>
+             </sl-split-panel>
+          </div>
+        </sl-split-panel>
+        `}
       </main>
     `;
   }
