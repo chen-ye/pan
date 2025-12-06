@@ -41,6 +41,8 @@ export class State {
   hasMore = signal(true);
   isLoading = signal(false);
   totalVideos = signal(0);
+  sortBy = signal("name");
+  sortOrder = signal("asc");
 
   dirTree = signal<TreeNode[]>([]);
   selectedDirs = signal<Set<string>>(new Set());
@@ -174,7 +176,7 @@ export class State {
       const dirParams = selectedDirs.map((d: string) =>
         `dirs=${encodeURIComponent(d)}`
       ).join("&");
-      const query = `page=${page}&limit=50` +
+      const query = `page=${page}&limit=50&sort=${this.sortBy.get()}&order=${this.sortOrder.get()}` +
         (dirParams ? `&${dirParams}` : "");
 
       const res = await fetch(`/api/videos?${query}`);
@@ -316,7 +318,17 @@ export class State {
     this.selectedDirs.set(next);
     this.updateUrl();
     this.loadVideos(true);
-    this.loadVideos(true);
+  }
+
+  setSort(by: string) {
+      if (this.sortBy.get() === by) {
+          // Toggle order
+          this.sortOrder.set(this.sortOrder.get() === "asc" ? "desc" : "asc");
+      } else {
+          this.sortBy.set(by);
+          this.sortOrder.set("asc");
+      }
+      this.loadVideos(true);
   }
 
   selectNextVideo() {
@@ -506,9 +518,10 @@ export class State {
           this.durationCache.set(path, Number(dur));
         }
 
-        const updatedList = currentList.map((v) => {
+      const updatedList = currentList.map((v) => {
           if (durationMap.has(v.path)) {
-            return { ...v, duration: Number(durationMap.get(v.path)) };
+            const d = Number(durationMap.get(v.path));
+            return { ...v, duration: isNaN(d) ? undefined : d };
           }
           return v;
         });

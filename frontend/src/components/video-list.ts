@@ -1,8 +1,13 @@
 import { css, html, LitElement } from "lit";
+import { repeat } from "lit/directives/repeat.js";
 import { SignalWatcher } from "@lit-labs/signals";
 import { State } from "../state.ts";
+import type { Video } from "../types.ts";
 import "@shoelace-style/shoelace/dist/components/icon-button/icon-button.js";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
+import "@shoelace-style/shoelace/dist/components/dropdown/dropdown.js";
+import "@shoelace-style/shoelace/dist/components/menu/menu.js";
+import "@shoelace-style/shoelace/dist/components/menu-item/menu-item.js";
 
 function formatDuration(seconds?: number) {
   if (!seconds) return "";
@@ -41,7 +46,7 @@ export class VideoList extends SignalWatcher(LitElement) {
       letter-spacing: 0.5px;
       color: var(--sl-color-neutral-500);
       font-weight: 600;
-      margin-bottom: var(--sl-spacing-small);
+      margin: 0;
     }
     .list-header {
       padding: var(--sl-spacing-medium);
@@ -50,6 +55,17 @@ export class VideoList extends SignalWatcher(LitElement) {
       background: var(--sl-color-neutral-50);
       z-index: 1;
       border-bottom: 1px solid var(--sl-color-neutral-200);
+      display: flex;
+      flex-direction: column;
+      gap: var(--sl-spacing-small);
+    }
+    .header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .list-header h3 {
+        margin: 0;
     }
     .video-item {
       padding: var(--sl-spacing-medium);
@@ -98,14 +114,64 @@ export class VideoList extends SignalWatcher(LitElement) {
       background: var(--sl-color-success-100);
       color: var(--sl-color-success-700);
     }
+    .tag.progress {
+      background: var(--sl-color-primary-100);
+      color: var(--sl-color-primary-700);
+    }
     .delete-btn {
       font-size: 1rem;
+    }
+    .status-btn {
+        flex: 1;
+    }
+    .status-btn::part(label) {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+    }
+    .status-text {
+        display: flex;
+        flex-direction: column;
+        align-items: start;
+        text-align: left;
+        line-height: 1.1;
+        flex: 1;
+    }
+    .status-primary {
+        font-weight: 600;
+        font-size: 0.8rem;
+    }
+    .status-secondary {
+        font-size: 0.7rem;
+        opacity: 0.8;
+    }
+    .load-more {
+        padding: 10px;
+        text-align: center;
+    }
+
+    .actions-container {
+        display: flex;
+        align-items: center;
+        gap: var(--sl-spacing-small);
+        width: 100%;
+    }
+    .process-btn {
+        flex: 1;
+    }
+    .list-header .section-title {
+        margin: 0;
     }
 
     /* Mobile responsive */
     @media (max-width: 768px) {
       .list-header {
         padding: var(--sl-spacing-small);
+      }
+      .actions-container {
+          flex-direction: column;
+          align-items: stretch;
       }
       .video-item {
         padding: var(--sl-spacing-small);
@@ -133,108 +199,87 @@ export class VideoList extends SignalWatcher(LitElement) {
 
   override render() {
     if (!this.state) {
-      return html`
-
-      `;
+      return html``;
     }
 
+    const sortLabel = {
+        name: "Name",
+        date: "Date",
+        size: "Size"
+    }[this.state.sortBy.get()] || "Name";
+
     return html`
-      <div
-        class="list-header"
-        style="display:flex; justify-content:space-between; align-items:center;"
-      >
-        <div class="section-title" style="margin-bottom:0">Videos (${this.state
-          .totalVideos.get()})</div>
+      <div class="list-header">
+        <div class="header-row">
+            <div class="section-title">Videos (${this.state.totalVideos.get()})</div>
 
-        ${(() => {
-             const job = this.state.processingJob.get();
-             const queue = this.state.processingQueue.get();
+            <sl-dropdown>
+              <sl-button slot="trigger" size="small" caret variant="text">
+                Sort: ${sortLabel}
+                ${this.state.sortOrder.get() === 'asc' ? '↑' : '↓'}
+              </sl-button>
+              <sl-menu>
+                <sl-menu-item @click=${() => this.state.setSort('name')}>Name</sl-menu-item>
+                <sl-menu-item @click=${() => this.state.setSort('date')}>Date</sl-menu-item>
+                <sl-menu-item @click=${() => this.state.setSort('size')}>Size</sl-menu-item>
+              </sl-menu>
+            </sl-dropdown>
+        </div>
 
-             if (job || queue.length > 0) {
-                 return html`
-                   <sl-button variant="text" size="small" @click=${() => this.dispatchEvent(new CustomEvent('open-queue', {bubbles: true, composed: true}))} style="color: var(--sl-color-primary-700);">
-                     <sl-icon slot="prefix" name="cpu"></sl-icon>
-                     ${job ? 'Processing...' : queue.length}
-                     ${job ? html`<span style="margin-left: 4px; font-weight: bold;">${(job.progress * 100).toFixed(0)}%</span>` : ''}
-                   </sl-button>
-                 `;
-             }
+        <div class="actions-container">
+            ${(() => {
+                 const job = this.state.processingJob.get();
+                 const queue = this.state.processingQueue.get();
 
-             return html`
-                <sl-button
-                  size="small"
-                  variant="primary"
-                  ?loading="${this.state.isBatchProcessing.get()}"
-                  @click="${() => this.state.processBatch()}"
-                >Process Page</sl-button>
-             `;
-         })()}
+                 if (job || queue.length > 0) {
+                     return html`
+                       <sl-button class="status-btn" variant="default" size="small" @click=${() => this.dispatchEvent(new CustomEvent('open-queue', {bubbles: true, composed: true}))}>
+                         <sl-icon slot="prefix" name="cpu"></sl-icon>
+                         <div class="status-text" id="queue-count">
+                            <span class="status-primary">
+                                ${job ? `Processing ${(job.progress * 100).toFixed(0)}%` : 'Queue Active'}
+                            </span>
+                            ${queue.length > 0 ? html`<span class="status-secondary">${queue.length} pending</span>` : ''}
+                         </div>
+                       </sl-button>
+                     `;
+                 }
+                 return html``;
+             })()}
+
+            <sl-button
+              class="process-btn"
+              size="small"
+              variant="primary"
+              ?loading="${this.state.isBatchProcessing.get()}"
+              @click="${() => this.state.processBatch()}"
+            >
+                <sl-icon slot="prefix" name="stack"></sl-icon>
+                Process Page
+            </sl-button>
+        </div>
       </div>
-      ${this.state.processingJob.get()
-        ? html`
-          <div
-            style="padding: 8px var(--sl-spacing-medium); background: var(--sl-color-primary-50); border-bottom: 1px solid var(--sl-color-neutral-200);"
-          >
-            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8rem;">
-              <sl-spinner style="font-size: 0.9rem; --track-width: 2px;"></sl-spinner>
-              <span
-                style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
-              >
-                ${this.state.processingJob.get()?.path.split("/").pop()}
-              </span>
-              <span style="color: var(--sl-color-primary-700); font-weight: 600;">
-                ${Math.round(
-                  (this.state.processingJob.get()?.progress || 0) * 100,
-                )}%
-              </span>
-            </div>
-            ${this.state.processingQueue.get().length > 0
-              ? html`
-                <div
-                  id="queue-count"
-                  style="font-size: 0.7rem; color: var(--sl-color-neutral-600); margin-top: 4px;"
-                >
-                  ${this.state.processingQueue.get().length} more in queue
-                </div>
-              `
-              : ""}
-          </div>
-        `
-        : ""} ${this.state.videos.get().map((v) => {
+
+      ${repeat(
+        this.state.videos.get(),
+        (v: Video) => v.path,
+        (v: Video) => {
           const job = this.state.processingJob.get();
           const isProcessing = job && job.path === v.path;
           return html`
-            <div class="video-item ${this.state.currentVideoPath.get() ===
-                v.path
-              ? "active"
-              : ""}" @click="${() => this.state.selectVideo(v.path)}">
+            <div class="video-item ${this.state.currentVideoPath.get() === v.path ? "active" : ""}"
+                 @click="${() => this.state.selectVideo(v.path)}">
               <div class="video-title" title="${v.name}">${v.name}</div>
               <div class="tag-container">
-                ${v.processed
-                  ? html`
-                    <span class="tag processed">Processed</span>
-                  `
-                  : ""} ${isProcessing
-                  ? html`
-                    <span
-                      class="tag"
-                      style="background:var(--sl-color-primary-100); color:var(--sl-color-primary-700)"
-                    >${Math.round((job?.progress || 0) * 100)}%</span>
-                  `
-                  : ""}
+                ${v.processed ? html`<span class="tag processed">Processed</span>` : ""}
+                ${isProcessing ? html`<span class="tag progress">${Math.round((job?.progress || 0) * 100)}%</span>` : ""}
                 <span class="tag">${formatSize(v.size)}</span>
-                ${v.duration
-                  ? html`
-                    <span class="tag">${formatDuration(v.duration)}</span>
-                  `
-                  : ""}
+                ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ""}
               </div>
               <div class="video-meta">
                 <span>Video</span>
                 ${isProcessing
-                  ? html`
-                    <sl-spinner style="font-size: 1rem; --track-width: 2px;"></sl-spinner>
-                  `
+                  ? html`<sl-spinner style="font-size: 1rem; --track-width: 2px;"></sl-spinner>`
                   : html`
                     <sl-icon-button
                       name="trash"
@@ -249,12 +294,15 @@ export class VideoList extends SignalWatcher(LitElement) {
               </div>
             </div>
           `;
-        })} ${this.state.hasMore.get()
+        }
+      )}
+
+      ${this.state.hasMore.get()
         ? html`
-          <div style="padding: 10px; text-align: center;">
-            <sl-button variant="default" ?loading="${this.state.isLoading
-              .get()}" @click="${() => this.state.loadVideos()}"
-            >Load More</sl-button>
+          <div class="load-more">
+            <sl-button variant="default" ?loading="${this.state.isLoading.get()}" @click="${() => this.state.loadVideos()}">
+                Load More
+            </sl-button>
           </div>
         `
         : ""}

@@ -14,6 +14,8 @@ router.get("/api/videos", async (ctx) => {
   const page = parseInt(ctx.request.url.searchParams.get("page") || "1");
   const limit = parseInt(ctx.request.url.searchParams.get("limit") || "50");
   const dirs = ctx.request.url.searchParams.getAll("dirs");
+  const sortBy = ctx.request.url.searchParams.get("sort") || "name"; // name, size, date
+  const order = ctx.request.url.searchParams.get("order") || "asc"; // asc, desc
 
   let filteredVideos = libraryService.getVideos();
 
@@ -23,6 +25,19 @@ router.get("/api/videos", async (ctx) => {
     });
   }
 
+  // Sorting
+  filteredVideos.sort((a, b) => {
+    let cmp = 0;
+    if (sortBy === "size") {
+        cmp = a.size - b.size;
+    } else if (sortBy === "date") {
+        cmp = a.mtime - b.mtime;
+    } else {
+        cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    }
+    return order === "desc" ? -cmp : cmp;
+  });
+
   const total = filteredVideos.length;
   const startIndex = (page - 1) * limit;
   const endIndex = startIndex + limit;
@@ -30,25 +45,30 @@ router.get("/api/videos", async (ctx) => {
 
   const mappedVideos = await Promise.all(pageVideos.map(async (v) => {
     const jsonPath = v.fullPath + ".json";
+    const legacyJsonPath = v.fullPath.substring(0, v.fullPath.lastIndexOf(".")) + ".json"; // Remove ext, add .json
+
     let processed = false;
     try {
-      // Check if .json file exists (supports both legacy and new formats)
+      // Check if .json file exists
       await Deno.stat(jsonPath);
       processed = true;
-    } catch { /* File doesn't exist */ }
+    } catch {
+        // Try legacy format (video.json instead of video.mp4.json)
+        try {
+            await Deno.stat(legacyJsonPath);
+            processed = true;
+        } catch { /* File doesn't exist */ }
+    }
 
-    let size = 0;
-    try {
-      const info = await Deno.stat(v.fullPath);
-      size = info.size;
-    } catch { /* File not accessible */ }
+    // Size is now in v.size, but let's trust the one we have to avoid extra syscall,
+    // or re-stat if we want to be super fresh. Library refresh is async so might be slightly stale.
+    // For listing, cached size is fine.
 
-    // We could fetch duration here but frontend does it in batch now
     return {
       path: v.path,
       name: v.name,
       processed: processed,
-      size: size,
+      size: v.size,
     };
   }));
 
@@ -148,8 +168,20 @@ router.get("/api/results/:path*", async (ctx) => {
   try {
     await send(ctx, resultPath + ".json", { root: CONFIG.DATA_DIR });
   } catch {
-    ctx.response.status = 404;
-    ctx.response.body = { error: "Result not found" };
+    // Try legacy path (replace extension with .json)
+    try {
+        const ext = resultPath.substring(resultPath.lastIndexOf("."));
+        const legacyPath = resultPath.substring(0, resultPath.lastIndexOf("."));
+        // Ensure we are replacing a valid video extension to avoid weird matches
+        if ([".mp4", ".mov", ".avi", ".mkv", ".webm"].includes(ext.toLowerCase())) {
+             await send(ctx, legacyPath + ".json", { root: CONFIG.DATA_DIR });
+             return;
+        }
+        throw new Error("Not found");
+    } catch {
+        ctx.response.status = 404;
+        ctx.response.body = { error: "Result not found" };
+    }
   }
 });
 

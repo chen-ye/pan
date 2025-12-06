@@ -7,6 +7,8 @@ export interface VideoEntry {
   path: string;
   name: string;
   fullPath: string;
+  size: number;
+  mtime: number;
 }
 
 export class LibraryService {
@@ -29,13 +31,21 @@ export class LibraryService {
       for await (const entry of walk(CONFIG.DATA_DIR)) {
         if (entry.isFile && this.isVideo(entry.name)) {
           const relPath = relative(CONFIG.DATA_DIR, entry.path);
-          tempLib.push({
-            path: relPath,
-            name: entry.name,
-            fullPath: entry.path,
-          });
+          try {
+             const info = await Deno.stat(entry.path);
+             tempLib.push({
+               path: relPath,
+               name: entry.name,
+               fullPath: entry.path,
+               size: info.size,
+               mtime: info.mtime?.getTime() || 0,
+             });
+          } catch {
+             // Skip if stat fails
+          }
         }
       }
+      // Default sort by name
       tempLib.sort((a, b) => a.name.localeCompare(b.name));
       this.library = tempLib;
       console.log(`Library refreshed. ${this.library.length} videos found.`);
