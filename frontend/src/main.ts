@@ -1,17 +1,39 @@
 
 import { LitElement, html, css } from "lit";
 import { Signal } from "signal-polyfill";
+import type SlButton from "@shoelace-style/shoelace/dist/components/button/button.js";
+
+interface Video {
+  path: string;
+  name: string;
+  processed: boolean;
+}
+
+interface Detection {
+  category: string;
+  conf: number;
+  timestamp: number;
+  bbox: number[];
+}
+
+interface Result {
+  detections: Detection[];
+  metadata: {
+    width: number;
+    height: number;
+  };
+}
 
 class State {
-  videos: any;
-  currentVideoPath: any;
-  currentResults: any;
-  playbackSpeed: any;
-  filterProcessed: any;
+  videos: Signal.State<Video[]>;
+  currentVideoPath: Signal.State<string | null>;
+  currentResults: Signal.State<Result | null>;
+  playbackSpeed: Signal.State<number>;
+  filterProcessed: Signal.State<boolean>;
 
   constructor() {
-    this.videos = new Signal.State([]);
-    this.currentVideoPath = new Signal.State(null);
+    this.videos = new Signal.State<Video[]>([]);
+    this.currentVideoPath = new Signal.State<string | null>(null);
     this.currentResults = new Signal.State(null);
     this.playbackSpeed = new Signal.State(5.0);
     this.filterProcessed = new Signal.State(false);
@@ -28,7 +50,7 @@ class State {
     }
   }
 
-  async selectVideo(path) {
+  async selectVideo(path: string) {
     this.currentVideoPath.set(path);
     this.currentResults.set(null);
 
@@ -49,7 +71,7 @@ class State {
     }
   }
 
-  async deleteVideo(path) {
+  async deleteVideo(path: string) {
     if (!confirm(`Delete ${path}?`)) return;
     await fetch(`/api/videos/${path}`, { method: 'DELETE' });
     await this.fetchVideos();
@@ -60,7 +82,7 @@ class State {
   }
 
   async processVideo(path: string) {
-      const btn = document.getElementById('process-btn') as any;
+      const btn = document.getElementById('process-btn') as SlButton;
       if(btn) btn.loading = true;
       try {
           const res = await fetch("/api/worker/process", {
@@ -291,12 +313,12 @@ class AppRoot extends LitElement {
     }
   `;
 
-  videoList: any[];
-  currentVideo: any;
-  results: any;
+  videoList: Video[];
+  currentVideo: string | null;
+  results: Result | null;
   playbackSpeed: number;
-  interval: any;
-  animReq: any;
+  interval: number | undefined;
+  animReq: number | undefined;
 
   constructor() {
     super();
@@ -502,7 +524,7 @@ class AppRoot extends LitElement {
     e.target.playbackRate = this.playbackSpeed;
   }
 
-  setSpeed(speed: any) {
+  setSpeed(speed: string) {
     state.playbackSpeed.set(parseFloat(speed));
     const video = this.querySelector('#main-video') as HTMLVideoElement;
     if (video) video.playbackRate = parseFloat(speed);
