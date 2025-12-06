@@ -1,13 +1,9 @@
-FROM python:3.10-slim
+FROM ultralytics/yolov5:latest
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+
 
 COPY pyproject.toml .
 # Install dependencies into the system environment (no venv needed in container)

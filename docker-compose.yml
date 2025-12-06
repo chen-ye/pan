@@ -6,7 +6,7 @@ services:
     working_dir: /app
     volumes:
       - .:/app
-      - ./data:/data
+      - /mnt/d/NVR/:/data
       - /app/frontend/node_modules
       - /app/frontend/dist
     command: deno run --allow-net --allow-read --allow-write --allow-run --watch backend/main.ts
@@ -19,8 +19,15 @@ services:
   worker:
     build: ./worker
     volumes:
-      - ./data:/data
+      - /mnt/d/NVR/:/data
     environment:
       - DATA_DIR=/data
     ports:
       - "5000:5000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
