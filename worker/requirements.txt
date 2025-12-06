@@ -1,9 +1,0 @@
-flask
-torch
-torchvision
-opencv-python
-ultralytics
-requests
-psutil
-pandas
-Pillow
