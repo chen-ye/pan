@@ -271,6 +271,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
           autoplay
           muted
           loop
+          crossorigin="anonymous"
           src="${window.location.protocol}//${window.location
             .hostname}:8000/videos/${currentPath}"
           @loadedmetadata="${this.onVideoLoad}"
@@ -299,16 +300,22 @@ export class VideoDetail extends SignalWatcher(LitElement) {
             <sl-button
               id="process-btn"
               variant="primary"
+              ?disabled="${isProcessingCurrent || this.state.processingQueue.get().includes(currentPath)}"
               ?loading="${!!processingStatus}"
               @click="${() => this.state.processVideo(currentPath)}"
             >
               <sl-icon slot="prefix" name="cpu"></sl-icon>
-              Process with AI
+              ${this.state.processingQueue.get().includes(currentPath) ? "Queued" : "Process with AI"}
             </sl-button>
           `
           : html`
-            <sl-button ?loading="${!!processingStatus}" @click="${() =>
-              this.state.processVideo(currentPath)}">Re-process</sl-button>
+            <sl-button
+                ?disabled="${isProcessingCurrent || this.state.processingQueue.get().includes(currentPath)}"
+                ?loading="${!!processingStatus}"
+                @click="${() => this.state.processVideo(currentPath)}"
+            >
+                ${this.state.processingQueue.get().includes(currentPath) ? "Queued" : "Re-process"}
+            </sl-button>
           `}
 
         <sl-button variant="warning" outline @click="${() =>
@@ -407,29 +414,26 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       await new Promise<void>((resolve) => {
         video.currentTime = det.timestamp;
         video.onseeked = () => {
-          // Set canvas size to match video dimensions
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
-
-          // Draw full frame
-          ctx.drawImage(video, 0, 0);
-
-          // Draw bounding box
+          // Calculate crop (normalized bbox to pixels)
           const [x1, y1, x2, y2] = det.bbox;
-          const rx = x1 * canvas.width;
-          const ry = y1 * canvas.height;
-          const rw = (x2 - x1) * canvas.width;
-          const rh = (y2 - y1) * canvas.height;
+          const vw = video.videoWidth;
+          const vh = video.videoHeight;
 
-          ctx.strokeStyle = det.category === "animal"
-            ? "#e91e63"
-            : det.category === "person"
-            ? "#2196f3"
-            : "#f00";
-          ctx.lineWidth = 4;
-          ctx.strokeRect(rx, ry, rw, rh);
+          // Padding could be added here, but strictly following "detection area"
+          const sx = Math.max(0, Math.floor(x1 * vw));
+          const sy = Math.max(0, Math.floor(y1 * vh));
+          const sw = Math.min(vw - sx, Math.ceil((x2 - x1) * vw));
+          const sh = Math.min(vh - sy, Math.ceil((y2 - y1) * vh));
 
-          thumbnails.push(canvas.toDataURL("image/jpeg", 0.7));
+          if (sw > 0 && sh > 0) {
+            canvas.width = sw;
+            canvas.height = sh;
+
+            // Draw cropped area
+            ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+
+            thumbnails.push(canvas.toDataURL("image/jpeg", 0.7));
+          }
           resolve();
         };
       });

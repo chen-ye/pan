@@ -199,6 +199,7 @@ router.get("/videos/:path*", async (ctx) => {
     ctx.response.body = file;
     ctx.response.type = "video/mp4";
     ctx.response.headers.set("Content-Length", fileInfo.size.toString());
+    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
   } catch {
     ctx.response.status = 404;
   }

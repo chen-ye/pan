@@ -378,11 +378,32 @@ export class State {
 
       const result = await res.json();
       console.log(`Queued ${result.queued} videos for processing`);
-      // Progress updates will come via SSE
+      this.fetchQueueStatus();
     } catch (e) {
       console.error("Failed to queue batch:", e);
       this.isBatchProcessing.set(false);
     }
+  }
+
+  async fetchQueueStatus() {
+    try {
+        const res = await fetch("/api/processing/status");
+        if (res.ok) {
+            const data = await res.json();
+            this.processingQueue.set(data.queue || []);
+        }
+    } catch (e) {
+        console.error("Failed to fetch queue status", e);
+    }
+  }
+
+  async clearQueue() {
+      try {
+          await fetch("/api/processing/queue", { method: "DELETE" });
+          this.fetchQueueStatus();
+      } catch (e) {
+          console.error("Failed to clear queue", e);
+      }
   }
 
   async processVideo(path: string, isBatch = false) {

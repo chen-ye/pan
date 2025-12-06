@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
-    "lib": ["deno.window", "dom", "esnext"]
+    "lib": ["deno.window", "dom", "esnext"],
+    "experimentalDecorators": false
   },
   "imports": {
     "vite": "npm:vite@^7.2.6",

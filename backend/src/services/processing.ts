@@ -21,11 +21,25 @@ class ProcessingService {
   }
 
   addToQueue(paths: string[]) {
-    this.queue.push(...paths);
-    if (!this.isProcessing) {
-      this.processNextInQueue();
+    // Deduplicate against current job and existing queue
+    const uniquePaths = paths.filter(p => {
+        const isProcessing = this.currentJob && this.currentJob.path === p;
+        const isQueued = this.queue.includes(p);
+        return !isProcessing && !isQueued;
+    });
+
+    if (uniquePaths.length > 0) {
+        this.queue.push(...uniquePaths);
+        if (!this.isProcessing) {
+            this.processNextInQueue();
+        }
     }
-    return { queued: paths.length, total: this.queue.length };
+
+    return {
+        queued: uniquePaths.length,
+        skipped: paths.length - uniquePaths.length,
+        total: this.queue.length + (this.isProcessing ? 1 : 0)
+    };
   }
 
   clearQueue() {
@@ -43,6 +57,17 @@ class ProcessingService {
 
     this.isProcessing = true;
     const path = this.queue.shift()!;
+
+    // Check if file still exists
+    try {
+        const fullPath = CONFIG.DATA_DIR + "/" + path;
+        await Deno.stat(fullPath);
+    } catch {
+        // File doesn't exist, skip it
+        console.warn(`Skipping missing file: ${path}`);
+        this.processNextInQueue();
+        return;
+    }
 
     this.currentJob = { path, progress: 0, status: "Starting..." };
     sseService.broadcastEvent("processing_started", {

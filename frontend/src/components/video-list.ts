@@ -145,12 +145,30 @@ export class VideoList extends SignalWatcher(LitElement) {
       >
         <div class="section-title" style="margin-bottom:0">Videos (${this.state
           .totalVideos.get()})</div>
-        <sl-button
-          size="small"
-          variant="primary"
-          ?loading="${this.state.isBatchProcessing.get()}"
-          @click="${() => this.state.processBatch()}"
-        >Process Page</sl-button>
+
+        ${(() => {
+             const job = this.state.processingJob.get();
+             const queue = this.state.processingQueue.get();
+
+             if (job || queue.length > 0) {
+                 return html`
+                   <sl-button variant="text" size="small" @click=${() => this.dispatchEvent(new CustomEvent('open-queue', {bubbles: true, composed: true}))} style="color: var(--sl-color-primary-700);">
+                     <sl-icon slot="prefix" name="cpu"></sl-icon>
+                     ${job ? 'Processing...' : queue.length}
+                     ${job ? html`<span style="margin-left: 4px; font-weight: bold;">${(job.progress * 100).toFixed(0)}%</span>` : ''}
+                   </sl-button>
+                 `;
+             }
+
+             return html`
+                <sl-button
+                  size="small"
+                  variant="primary"
+                  ?loading="${this.state.isBatchProcessing.get()}"
+                  @click="${() => this.state.processBatch()}"
+                >Process Page</sl-button>
+             `;
+         })()}
       </div>
       ${this.state.processingJob.get()
         ? html`
@@ -173,6 +191,7 @@ export class VideoList extends SignalWatcher(LitElement) {
             ${this.state.processingQueue.get().length > 0
               ? html`
                 <div
+                  id="queue-count"
                   style="font-size: 0.7rem; color: var(--sl-color-neutral-600); margin-top: 4px;"
                 >
                   ${this.state.processingQueue.get().length} more in queue

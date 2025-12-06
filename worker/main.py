@@ -75,7 +75,7 @@ def process_video_generator(rel_path):
     processed_count = 0
     est_total_processed = total_frames / frame_interval
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = 32
     batch_images = [] # List of numpy arrays (RGB)
     batch_indices = [] # List of frame numbers
 

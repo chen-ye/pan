@@ -8,6 +8,8 @@ import "./components/video-list.ts";
 import "./components/filter-panel.ts";
 import "./components/video-list.ts";
 import "./components/video-detail.ts";
+import "./components/queue-dialog.ts";
+import type { QueueDialog } from "./components/queue-dialog.ts";
 import "@shoelace-style/shoelace/dist/components/split-panel/split-panel.js";
 
 setBasePath("/shoelace");
@@ -60,7 +62,18 @@ class AppRoot extends SignalWatcher(LitElement) {
     super.connectedCallback();
     this.state.fetchDirs();
     this.state.loadVideos(true);
+    // Periodically sync queue status if processing
+    setInterval(() => {
+        if (this.state.processingJob.get() || this.state.processingQueue.get().length > 0) {
+            this.state.fetchQueueStatus();
+        }
+    }, 5000);
     globalThis.addEventListener("keydown", this.handleKeyDown);
+  }
+
+  openQueue() {
+      const dialog = this.shadowRoot?.querySelector('queue-dialog') as QueueDialog;
+      if (dialog) dialog.show();
   }
 
   override disconnectedCallback() {
@@ -301,6 +314,10 @@ class AppRoot extends SignalWatcher(LitElement) {
         </div>
       </header>
 
+
+
+      <queue-dialog .state="${this.state}"></queue-dialog>
+
       <!-- Mobile Filter Drawer -->
       <div class="filter-overlay ${this.state.showFilters.get()
         ? "open"
@@ -321,7 +338,7 @@ class AppRoot extends SignalWatcher(LitElement) {
           ? html`
         <!-- Mobile Layout -->
         <div id="list-col">
-          <video-list .state="${this.state}"></video-list>
+          <video-list .state="${this.state}" @open-queue="${() => this.openQueue()}"></video-list>
         </div>
         <div id="detail-col">
           <video-detail .state="${this.state}"></video-detail>
@@ -339,7 +356,7 @@ class AppRoot extends SignalWatcher(LitElement) {
              <!-- Inner split: List vs Detail -->
              <sl-split-panel position-in-pixels="320" primary="start">
                <div slot="start" id="list-col" style="height: 100%; width: 100%; border-right: none;">
-                  <video-list .state="${this.state}"></video-list>
+                  <video-list .state="${this.state}" @open-queue="${() => this.openQueue()}"></video-list>
                </div>
                <div slot="end" id="detail-col" style="height: 100%; width: 100%;">
                   <video-detail .state="${this.state}"></video-detail>
