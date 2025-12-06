@@ -101,6 +101,30 @@ export class VideoList extends SignalWatcher(LitElement) {
     .delete-btn {
       font-size: 1rem;
     }
+
+    /* Mobile responsive */
+    @media (max-width: 768px) {
+        .list-header {
+            padding: var(--sl-spacing-small);
+        }
+        .video-item {
+            padding: var(--sl-spacing-small);
+            gap: 4px;
+        }
+        .video-title {
+            font-size: 0.8rem;
+        }
+        .tag {
+            font-size: 0.65rem;
+            padding: 1px 4px;
+        }
+        .video-meta {
+            font-size: 0.7rem;
+        }
+        .section-title {
+            font-size: 0.7rem;
+        }
+    }
     `;
 
     render() {

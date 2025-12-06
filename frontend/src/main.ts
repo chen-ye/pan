@@ -11,10 +11,16 @@ setBasePath('/shoelace');
 
 class AppRoot extends SignalWatcher(LitElement) {
   state: State;
+  showFilters = false;
 
   constructor() {
     super();
     this.state = new State();
+  }
+
+  toggleFilters() {
+    this.showFilters = !this.showFilters;
+    this.requestUpdate();
   }
 
   handleKeyDown = (e: KeyboardEvent) => {
@@ -77,6 +83,7 @@ class AppRoot extends SignalWatcher(LitElement) {
       background: var(--sl-color-neutral-50);
       display: flex;
       flex-direction: column;
+      overflow-y: auto;
     }
 
     #list-col {
@@ -99,6 +106,104 @@ class AppRoot extends SignalWatcher(LitElement) {
       align-items: center;
       gap: 10px;
     }
+
+    .gpu-info {
+      font-size: 0.8rem;
+      color: var(--sl-color-neutral-600);
+      margin-right: 15px;
+    }
+
+    /* Mobile breakpoint - tablets and below */
+    @media (max-width: 1024px) {
+      #filters-col {
+        width: 200px;
+      }
+      #list-col {
+        width: 280px;
+      }
+      .gpu-info {
+        display: none;
+      }
+    }
+
+    /* Mobile breakpoint - phones */
+    @media (max-width: 768px) {
+      main {
+        flex-direction: column;
+      }
+
+      #filters-col {
+        display: none; /* Hide filters on mobile, could add a toggle */
+      }
+
+      #list-col {
+        width: 100%;
+        height: 40vh;
+        border-right: none;
+        border-bottom: 1px solid var(--sl-color-neutral-200);
+      }
+
+      #detail-col {
+        flex: 1;
+        min-height: 0;
+      }
+
+      header {
+        padding: 0 var(--sl-spacing-small);
+        height: 50px;
+      }
+
+      h1 {
+        font-size: 1rem;
+      }
+
+      .header-actions sl-button {
+        display: none;
+      }
+      .mobile-filter-btn {
+        display: block !important;
+      }
+    }
+
+    .mobile-filter-btn {
+      display: none;
+    }
+
+    .filter-overlay {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 100;
+    }
+    .filter-overlay.open {
+      display: block;
+    }
+
+    .filter-drawer {
+      position: fixed;
+      top: 0;
+      left: -280px;
+      width: 280px;
+      height: 100%;
+      background: var(--sl-color-neutral-50);
+      z-index: 101;
+      transition: left 0.3s ease;
+      overflow-y: auto;
+    }
+    .filter-drawer.open {
+      left: 0;
+    }
+    .filter-drawer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: var(--sl-spacing-medium);
+      border-bottom: 1px solid var(--sl-color-neutral-200);
+    }
   `;
 
   render() {
@@ -113,13 +218,17 @@ class AppRoot extends SignalWatcher(LitElement) {
 
     return html`
       <header>
-        <h1>Pan NVR</h1>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <sl-icon-button class="mobile-filter-btn" name="funnel" label="Filters" @click=${() => this.toggleFilters()}></sl-icon-button>
+            <h1>Pan NVR</h1>
+        </div>
         <div class="header-actions">
              ${gpu ? html`
                  <div style="font-size: 0.8rem; color: var(--sl-color-neutral-600); margin-right: 15px;">
                     ${gpu.error ? html`<span style="color: var(--sl-color-danger-600)">GPU Error: ${gpu.error}</span>` :
                     html`
                         <span>${gpu.gpu_name}</span>
+                        <span style="margin-left: 8px;">${gpu.utilization !== undefined ? `${gpu.utilization}% GPU` : ''}</span>
                         <span style="margin-left: 8px;">${formatSize(gpu.memory_used)} / ${formatSize(gpu.memory_total)}</span>
                     `}
                  </div>
@@ -127,6 +236,16 @@ class AppRoot extends SignalWatcher(LitElement) {
              <sl-button size="small" variant="neutral" href="https://github.com/microsoft/CameraTraps" target="_blank">MegaDetector</sl-button>
         </div>
       </header>
+
+      <!-- Mobile Filter Drawer -->
+      <div class="filter-overlay ${this.showFilters ? 'open' : ''}" @click=${() => this.toggleFilters()}></div>
+      <div class="filter-drawer ${this.showFilters ? 'open' : ''}">
+          <div class="filter-drawer-header">
+              <h3 style="margin: 0;">Filters</h3>
+              <sl-icon-button name="x-lg" label="Close" @click=${() => this.toggleFilters()}></sl-icon-button>
+          </div>
+          <filter-panel .state=${this.state}></filter-panel>
+      </div>
       <main>
         <!-- Filters Column -->
         <div id="filters-col">

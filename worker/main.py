@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Load Model
-# Using MDv5a as the stable default in the v1000 package ecosystem.
-# If a specific v1000 model alias is available (e.g. 'MDV1000'), update here.
-MODEL_VERSION = "mdv1000-cedar"
+# Using MDV5A as the stable default - MDv1000 produces invalid class IDs
+MODEL_VERSION = "MDv1000-redwood"
 logger.info(f"Loading MegaDetector model: {MODEL_VERSION}...")
 
 try:
@@ -88,6 +87,13 @@ def process_video_generator(rel_path):
             # Conversion to PIL
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(frame_rgb)
+
+            # Resize to 640px (model expected input size) while maintaining aspect ratio
+            max_dim = max(pil_img.size)
+            if max_dim > 1280:
+                scale = 1280 / max_dim
+                new_size = (int(pil_img.size[0] * scale), int(pil_img.size[1] * scale))
+                pil_img = pil_img.resize(new_size, Image.LANCZOS)
 
             # Inference
             result = model.generate_detections_one_image(pil_img)
@@ -177,6 +183,7 @@ def status():
 
 @app.route('/stats', methods=['GET'])
 def handle_stats():
+    import subprocess
     stats = {}
     if torch.cuda.is_available():
         stats['gpu_name'] = torch.cuda.get_device_name(0)
@@ -184,6 +191,17 @@ def handle_stats():
         stats['memory_free'] = free
         stats['memory_total'] = total
         stats['memory_used'] = total - free
+
+        # Get GPU utilization via nvidia-smi
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                stats['utilization'] = int(result.stdout.strip().split('\n')[0])
+        except Exception:
+            pass
     else:
         stats['error'] = "No CUDA device found"
 

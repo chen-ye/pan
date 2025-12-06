@@ -121,6 +121,46 @@ export class VideoDetail extends SignalWatcher(LitElement) {
         font-size: 0.7rem;
         text-align: center;
     }
+
+    /* Mobile responsive */
+    @media (max-width: 768px) {
+        .video-container {
+            min-height: 200px;
+        }
+        .controls-bar {
+            flex-wrap: wrap;
+            padding: var(--sl-spacing-small);
+            gap: var(--sl-spacing-small);
+        }
+        .speed-slider {
+            width: 120px;
+        }
+        .speed-label {
+            min-width: 45px;
+            font-size: 0.8rem;
+        }
+        .spacer {
+            flex-basis: 100%;
+            height: 0;
+        }
+        .controls-bar sl-button {
+            font-size: 0.75rem;
+        }
+        .info-panel {
+            padding: var(--sl-spacing-small);
+        }
+        .info-panel h3 {
+            font-size: 0.9rem;
+            margin: 0.5em 0;
+        }
+        .info-panel p {
+            font-size: 0.8rem;
+            margin: 0.3em 0;
+        }
+        .thumbnail-gallery {
+            grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+        }
+    }
     `;
 
     connectedCallback() {
