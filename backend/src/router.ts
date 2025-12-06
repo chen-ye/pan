@@ -1,9 +1,11 @@
-import { Router, send, ServerSentEvent } from "jsr:@oak/oak";
-import { join, relative } from "@std/path";
+import { Router, send } from "@oak/oak";
+import { join } from "@std/path";
 import { CONFIG } from "./config.ts";
 import { libraryService } from "./services/library.ts";
 import { metadataService } from "./services/metadata.ts";
 import { sseService } from "./services/sse.ts";
+import { processingService } from "./services/processing.ts";
+import { getDirTree } from "./services/files.ts";
 
 export const router = new Router();
 
@@ -33,13 +35,13 @@ router.get("/api/videos", async (ctx) => {
             // Check if .json file exists (supports both legacy and new formats)
             await Deno.stat(jsonPath);
             processed = true;
-        } catch {}
+        } catch { /* File doesn't exist */ }
 
         let size = 0;
         try {
             const info = await Deno.stat(v.fullPath);
             size = info.size;
-        } catch {}
+        } catch { /* File not accessible */ }
 
         // We could fetch duration here but frontend does it in batch now
         return {
@@ -68,9 +70,9 @@ router.delete("/api/videos/:path*", async (ctx) => {
     try {
         await libraryService.deleteVideo(videoPath);
         ctx.response.body = { success: true };
-    } catch (e: any) {
+    } catch (e: unknown) {
         ctx.response.status = 500; // Or 400 if validation error
-        ctx.response.body = { error: e.message };
+        ctx.response.body = { error: e instanceof Error ? e.message : String(e) };
     }
 });
 
@@ -86,9 +88,9 @@ router.post("/api/videos/move", async (ctx) => {
     try {
         const newPath = await libraryService.moveVideo(videoPath);
         ctx.response.body = { success: true, newPath };
-    } catch (e: any) {
+    } catch (e: unknown) {
          ctx.response.status = 500;
-         ctx.response.body = { error: e.message };
+         ctx.response.body = { error: e instanceof Error ? e.message : String(e) };
     }
 });
 
@@ -124,23 +126,6 @@ router.post("/api/videos/durations", async (ctx) => {
 
 // 5. Get Dirs
 router.get("/api/dirs", async (ctx) => {
-    // Helper within router for now
-    async function getDirTree(currentPath: string): Promise<any[]> {
-        const nodes: any[] = [];
-        for await (const entry of Deno.readDir(currentPath)) {
-            if (entry.isDirectory) {
-                const fullPath = join(currentPath, entry.name);
-                const relativePath = relative(CONFIG.DATA_DIR, fullPath);
-                nodes.push({
-                    name: entry.name,
-                    path: relativePath,
-                    children: await getDirTree(fullPath)
-                });
-            }
-        }
-        nodes.sort((a, b) => a.name.localeCompare(b.name));
-        return nodes;
-    }
     const tree = await getDirTree(CONFIG.DATA_DIR);
     ctx.response.body = tree;
 });
@@ -183,9 +168,9 @@ router.all("/api/worker/(.*)", async (ctx) => {
                  ctx.response.headers.set(key, value);
              }
         }
-    } catch (e: any) {
+    } catch (e: unknown) {
         ctx.response.status = 502;
-        ctx.response.body = { error: "Worker unavailable: " + e.message };
+        ctx.response.body = { error: "Worker unavailable: " + (e instanceof Error ? e.message : String(e)) };
     }
 });
 
@@ -209,7 +194,27 @@ router.get("/videos/:path*", async (ctx) => {
 });
 
 // 9. SSE
-router.get("/api/events", (ctx) => {
-    const target = ctx.sendEvents();
+router.get("/api/events", async (ctx) => {
+    const target = await ctx.sendEvents();
     sseService.addClient(target);
+});
+
+// 10. Processing Queue
+router.get("/api/processing/status", (ctx) => {
+    ctx.response.body = processingService.getStatus();
+});
+
+router.post("/api/processing/queue", async (ctx) => {
+    let body;
+    try { body = await ctx.request.body.json(); } catch { ctx.throw(400); return; }
+
+    const paths = body.paths;
+    if (!Array.isArray(paths)) { ctx.throw(400, "paths must be an array"); return; }
+
+    const result = processingService.addToQueue(paths);
+    ctx.response.body = result;
+});
+
+router.delete("/api/processing/queue", (ctx) => {
+    ctx.response.body = processingService.clearQueue();
 });

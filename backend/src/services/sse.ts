@@ -1,4 +1,4 @@
-import { ServerSentEvent, ServerSentEventTarget } from "jsr:@oak/oak";
+import { ServerSentEvent, ServerSentEventTarget } from "@oak/oak";
 
 export class SSEService {
     private clients = new Set<ServerSentEventTarget>();
@@ -10,10 +10,14 @@ export class SSEService {
     }
 
     notifyUpdate() {
+        this.broadcastEvent("update", { timestamp: Date.now() });
+    }
+
+    broadcastEvent(eventType: string, data: unknown) {
         for (const target of this.clients) {
             try {
-                target.dispatchEvent(new ServerSentEvent("update", { data: JSON.stringify({ timestamp: Date.now() }) }));
-            } catch (e) {
+                target.dispatchEvent(new ServerSentEvent(eventType, { data: JSON.stringify(data) }));
+            } catch {
                 // Client disconnected, remove from set
                 this.clients.delete(target);
             }

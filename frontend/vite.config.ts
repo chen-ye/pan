@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 const iconsPath = 'node_modules/@shoelace-style/shoelace/dist/assets/icons';
 
@@ -39,8 +40,10 @@ export default defineConfig({
       '/api': {
         target: 'http://app:8000',
         changeOrigin: true,
-        configure: (proxy, _options) => {
-          proxy.on('error', (err: any, _req, _res) => {
+        // deno-lint-ignore no-explicit-any
+        configure: (proxy: any) => {
+          // deno-lint-ignore no-explicit-any
+          (proxy as any).on('error', (err: Error & { code?: string }, _req: IncomingMessage, _res: ServerResponse) => {
             if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' || err.message?.includes('AbortError')) return;
             console.log('proxy error', err);
           });
@@ -49,8 +52,10 @@ export default defineConfig({
       '/videos': {
         target: 'http://app:8000',
         changeOrigin: true,
-        configure: (proxy, _options) => {
-          proxy.on('error', (err, _req, _res) => {
+        // deno-lint-ignore no-explicit-any
+        configure: (proxy: any) => {
+          // deno-lint-ignore no-explicit-any
+          (proxy as any).on('error', (err: Error, _req: IncomingMessage, _res: ServerResponse) => {
             console.log('proxy error', err);
           });
         }

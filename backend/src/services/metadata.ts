@@ -1,8 +1,10 @@
-import { join, relative } from "@std/path";
+import { relative } from "@std/path";
 import { CONFIG, GLOBAL_OPTS } from "../config.ts";
 
+interface CacheEntry { duration: number }
+
 export class MetadataService {
-    private cache = new Map<string, any>();
+    private cache = new Map<string, CacheEntry>();
     private dirty = false;
 
     constructor() {
@@ -37,7 +39,7 @@ export class MetadataService {
     async getDuration(fullPath: string): Promise<number | undefined> {
         const relPath = relative(CONFIG.DATA_DIR, fullPath);
         if (this.cache.has(relPath)) {
-            return this.cache.get(relPath).duration;
+            return this.cache.get(relPath)?.duration;
         }
 
         const cmd = new Deno.Command("ffprobe", {

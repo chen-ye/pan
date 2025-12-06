@@ -1,9 +1,13 @@
-import { Application, send } from "jsr:@oak/oak";
+import { Application, send } from "@oak/oak";
 import { join } from "@std/path";
 import { CONFIG } from "./src/config.ts";
 import { router } from "./src/router.ts";
+import { statsService } from "./src/services/stats.ts";
 
 console.log("Backend starting...");
+
+// Start GPU stats polling
+statsService.start();
 
 const app = new Application();
 
@@ -21,10 +25,10 @@ app.use(async (ctx, next) => {
 
   try {
     await next();
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Server error:", err);
     ctx.response.status = 500;
-    ctx.response.body = { error: err.message };
+    ctx.response.body = { error: err instanceof Error ? err.message : String(err) };
   }
 });
 

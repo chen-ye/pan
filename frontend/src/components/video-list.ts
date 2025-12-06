@@ -135,6 +135,24 @@ export class VideoList extends SignalWatcher(LitElement) {
                 <div class="section-title" style="margin-bottom:0">Videos (${this.state.totalVideos.get()})</div>
                 <sl-button size="small" variant="primary" ?loading=${this.state.isBatchProcessing.get()} @click=${() => this.state.processBatch()}>Process Page</sl-button>
             </div>
+            ${this.state.processingJob.get() ? html`
+                <div style="padding: 8px var(--sl-spacing-medium); background: var(--sl-color-primary-50); border-bottom: 1px solid var(--sl-color-neutral-200);">
+                    <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8rem;">
+                        <sl-spinner style="font-size: 0.9rem; --track-width: 2px;"></sl-spinner>
+                        <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                            ${this.state.processingJob.get()?.path.split('/').pop()}
+                        </span>
+                        <span style="color: var(--sl-color-primary-700); font-weight: 600;">
+                            ${Math.round((this.state.processingJob.get()?.progress || 0) * 100)}%
+                        </span>
+                    </div>
+                    ${this.state.processingQueue.get().length > 0 ? html`
+                        <div style="font-size: 0.7rem; color: var(--sl-color-neutral-600); margin-top: 4px;">
+                            ${this.state.processingQueue.get().length} more in queue
+                        </div>
+                    ` : ''}
+                </div>
+            ` : ''}
             ${this.state.videos.get().map(v => {
                 const job = this.state.processingJob.get();
                 const isProcessing = job && job.path === v.path;

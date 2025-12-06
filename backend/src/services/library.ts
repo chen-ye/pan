@@ -54,7 +54,7 @@ export class LibraryService {
          const fullPath = join(CONFIG.DATA_DIR, relPath);
 
          await Deno.remove(fullPath);
-         try { await Deno.remove(fullPath + ".json"); } catch {}
+         try { await Deno.remove(fullPath + ".json"); } catch { /* JSON may not exist */ }
 
          this.library = this.library.filter(v => v.path !== relPath);
     }
@@ -79,7 +79,7 @@ export class LibraryService {
 
         try {
             await Deno.rename(fullSrcPath + ".json", fullDestPath + ".json");
-        } catch {}
+        } catch { /* JSON may not exist */ }
 
         this.library = this.library.filter(v => v.path !== relPath);
         return destRelPath;

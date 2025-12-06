@@ -11,7 +11,6 @@ setBasePath('/shoelace');
 
 class AppRoot extends SignalWatcher(LitElement) {
   state: State;
-  showFilters = false;
 
   constructor() {
     super();
@@ -19,8 +18,7 @@ class AppRoot extends SignalWatcher(LitElement) {
   }
 
   toggleFilters() {
-    this.showFilters = !this.showFilters;
-    this.requestUpdate();
+    this.state.showFilters.set(!this.state.showFilters.get());
   }
 
   handleKeyDown = (e: KeyboardEvent) => {
@@ -40,12 +38,12 @@ class AppRoot extends SignalWatcher(LitElement) {
     super.connectedCallback();
     this.state.fetchDirs();
     this.state.loadVideos(true);
-    window.addEventListener('keydown', this.handleKeyDown);
+    globalThis.addEventListener('keydown', this.handleKeyDown);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
-    window.removeEventListener('keydown', this.handleKeyDown);
+    globalThis.removeEventListener('keydown', this.handleKeyDown);
   }
 
   static styles = css`
@@ -238,8 +236,8 @@ class AppRoot extends SignalWatcher(LitElement) {
       </header>
 
       <!-- Mobile Filter Drawer -->
-      <div class="filter-overlay ${this.showFilters ? 'open' : ''}" @click=${() => this.toggleFilters()}></div>
-      <div class="filter-drawer ${this.showFilters ? 'open' : ''}">
+      <div class="filter-overlay ${this.state.showFilters.get() ? 'open' : ''}" @click=${() => this.toggleFilters()}></div>
+      <div class="filter-drawer ${this.state.showFilters.get() ? 'open' : ''}">
           <div class="filter-drawer-header">
               <h3 style="margin: 0;">Filters</h3>
               <sl-icon-button name="x-lg" label="Close" @click=${() => this.toggleFilters()}></sl-icon-button>
@@ -266,4 +264,4 @@ class AppRoot extends SignalWatcher(LitElement) {
   }
 }
 
-customElements.define('app-root', AppRoot);
+customElements.define('app-root', AppRoot as unknown as CustomElementConstructor);

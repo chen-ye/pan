@@ -1,7 +1,6 @@
 import { LitElement, html, css } from 'lit';
 import { SignalWatcher } from '@lit-labs/signals';
 import { State } from '../state.ts';
-import { effect } from 'signal-utils/subtle/microtask-effect';
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "@shoelace-style/shoelace/dist/components/icon/icon.js";
 import "@shoelace-style/shoelace/dist/components/range/range.js";

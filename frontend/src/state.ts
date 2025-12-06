@@ -1,6 +1,18 @@
 import { signal } from "@lit-labs/signals";
 import type SlButton from "@shoelace-style/shoelace/dist/components/button/button.js";
-import type { TreeNode, Video, Result } from "./types.ts";
+import type { TreeNode, Video, Result, GpuStats, Detection } from "./types.ts";
+
+interface LegacyAnnotation {
+  img_id?: string;
+  bbox?: number[][];
+  category?: string[];
+  confidence?: number[];
+}
+
+interface ProcessingStartedEvent { path: string; queueLength?: number }
+interface ProcessingProgressEvent { path: string; progress: number; status: string }
+interface ProcessingErrorEvent { error: string }
+interface VideosResponse { items: Video[]; total: number; page: number; limit: number }
 
 export class State {
   videos = signal<Video[]>([]);
@@ -8,6 +20,8 @@ export class State {
   currentResults = signal<Result | null>(null);
   playbackSpeed = signal(5.0);
   filterProcessed = signal(false);
+
+  showFilters = signal(false);
 
   currentPage = signal(1);
   hasMore = signal(true);
@@ -18,10 +32,10 @@ export class State {
   selectedDirs = signal<Set<string>>(new Set());
   error = signal<string | null>(null);
 
-  gpuStats = signal<any>(null);
+  gpuStats = signal<GpuStats | null>(null);
 
   constructor() {
-      const params = new URLSearchParams(window.location.search);
+      const params = new URLSearchParams(globalThis.location.search);
       if (params.has('video')) this.currentVideoPath.set(params.get('video'));
       if (params.has('speed')) this.playbackSpeed.set(parseFloat(params.get('speed')!));
       if (params.has('processed')) this.filterProcessed.set(params.get('processed') === 'true');
@@ -37,17 +51,40 @@ export class State {
           this.loadVideos(true);
       });
 
-      // Poll GPU stats
-      setInterval(async () => {
-          try {
-              const res = await fetch("/api/worker/stats");
-              if (res.ok) {
-                  this.gpuStats.set(await res.json());
-              }
-          } catch {}
-      }, 5000);
-      // Initial fetch
-      fetch("/api/worker/stats").then(r => r.ok && r.json()).then(d => d && this.gpuStats.set(d)).catch(() => {});
+      // Listen for processing updates from server
+      evtSource.addEventListener("processing_started", (e: MessageEvent) => {
+          const data = JSON.parse(e.data) as ProcessingStartedEvent;
+          this.processingJob.set({ path: data.path, progress: 0, status: "Starting..." });
+      });
+
+      evtSource.addEventListener("processing_progress", (e: MessageEvent) => {
+          const data = JSON.parse(e.data) as ProcessingProgressEvent;
+          this.processingJob.set({ path: data.path, progress: data.progress, status: data.status });
+      });
+
+      evtSource.addEventListener("processing_done", () => {
+          this.loadVideos(false); // Refresh to show updated status
+      });
+
+      evtSource.addEventListener("video_processed", () => {
+          this.loadVideos(false);
+      });
+
+      evtSource.addEventListener("processing_complete", () => {
+          this.processingJob.set(null);
+          this.isBatchProcessing.set(false);
+      });
+
+      evtSource.addEventListener("processing_error", (e: MessageEvent) => {
+          const data = JSON.parse(e.data) as ProcessingErrorEvent;
+          console.error("Processing error:", data.error);
+      });
+
+      // Receive GPU stats via SSE (pushed from server)
+      evtSource.addEventListener("gpu_stats", (e: MessageEvent) => {
+          const data = JSON.parse(e.data) as GpuStats;
+          this.gpuStats.set(data);
+      });
   }
 
   updateUrl() {
@@ -64,8 +101,8 @@ export class State {
       const dirs = Array.from(this.selectedDirs.get());
       if (dirs.length > 0) params.set('dirs', dirs.join(','));
 
-      const newUrl = `${window.location.pathname}?${params.toString()}`;
-      window.history.replaceState({}, '', newUrl);
+      const newUrl = `${globalThis.location.pathname}?${params.toString()}`;
+      globalThis.history.replaceState({}, '', newUrl);
   }
 
   setPlaybackSpeed(speed: number) {
@@ -90,9 +127,10 @@ export class State {
           const data = await res.json();
           console.log("Dirs fetched:", data.length);
           this.dirTree.set(data);
-      } catch (e: any) {
+      } catch (e: unknown) {
           console.error("Failed to fetch dirs", e);
-          this.error.set("Failed to fetch dirs: " + e.message);
+          const msg = e instanceof Error ? e.message : String(e);
+          this.error.set("Failed to fetch dirs: " + msg);
       }
   }
 
@@ -110,11 +148,11 @@ export class State {
       const page = reset ? 1 : this.currentPage.get();
 
       const selectedDirs = Array.from(this.selectedDirs.get());
-      const dirParams = selectedDirs.map(d => `dirs=${encodeURIComponent(d)}`).join('&');
+      const dirParams = selectedDirs.map((d: string) => `dirs=${encodeURIComponent(d)}`).join('&');
       const query = `page=${page}&limit=50` + (dirParams ? `&${dirParams}` : '');
 
       const res = await fetch(`/api/videos?${query}`);
-      const data = await res.json();
+      const data = await res.json() as VideosResponse;
 
       // Backend returns { items: [], total: ..., page: ..., limit: ... }
       const newItems = data.items;
@@ -147,13 +185,14 @@ export class State {
     }
   }
 
+  // deno-lint-ignore no-explicit-any
   normalizeLegacyFormat(data: any): any {
       // Check if data has legacy format (annotations array)
       if (data.annotations && Array.isArray(data.annotations)) {
           console.log("Converting legacy format to new format");
-          const detections: any[] = [];
+          const detections: Detection[] = [];
 
-          data.annotations.forEach((ann: any) => {
+          data.annotations.forEach((ann: LegacyAnnotation) => {
               const frameNum = parseInt(ann.img_id || "0");
               const bboxes = ann.bbox || [];
               const categories = ann.category || [];
@@ -285,36 +324,37 @@ export class State {
   processingQueue = signal<string[]>([]);
   isBatchProcessing = signal(false);
 
-  // ...
-
   async processBatch() {
       if (this.isBatchProcessing.get()) return;
-      this.isBatchProcessing.set(true);
 
       const videos = this.videos.get();
       // Filter for unprocessed videos
-      const queue = videos.filter(v => !v.processed).map(v => v.path);
+      const paths = videos.filter(v => !v.processed).map(v => v.path);
 
-      if (queue.length === 0) {
+      if (paths.length === 0) {
           alert("No unprocessed videos to process.");
-          this.isBatchProcessing.set(false);
           return;
       }
 
-      this.processingQueue.set(queue);
-      await this.processQueueLoop();
-      this.isBatchProcessing.set(false);
-  }
+      this.isBatchProcessing.set(true);
 
-  async processQueueLoop() {
-      while (this.processingQueue.get().length > 0) {
-          const queue = this.processingQueue.get();
-          const nextPath = queue[0];
+      try {
+          const res = await fetch("/api/processing/queue", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ paths })
+          });
 
-          await this.processVideo(nextPath, true);
+          if (!res.ok) {
+              throw new Error(`Failed to queue: ${res.status}`);
+          }
 
-          // Remove from queue
-          this.processingQueue.set(this.processingQueue.get().slice(1));
+          const result = await res.json();
+          console.log(`Queued ${result.queued} videos for processing`);
+          // Progress updates will come via SSE
+      } catch (e) {
+          console.error("Failed to queue batch:", e);
+          this.isBatchProcessing.set(false);
       }
   }
 
@@ -374,8 +414,8 @@ export class State {
               await this.selectVideo(path); // This fetches results
           }
 
-      } catch (e: any) {
-          if (!isBatch) alert("Processing failed: " + e.message);
+      } catch (e: unknown) {
+          if (!isBatch) alert("Processing failed: " + (e instanceof Error ? e.message : String(e)));
           console.error(`Processing failed for ${path}:`, e);
       } finally {
           this.processingJob.set(null);
@@ -441,8 +481,8 @@ export class State {
               this.currentResults.set(null);
           }
            this.updateUrl();
-      } catch (e: any) {
-          alert("Move failed: " + e.message);
+      } catch (e: unknown) {
+          alert("Move failed: " + (e instanceof Error ? e.message : String(e)));
       }
   }
 }
