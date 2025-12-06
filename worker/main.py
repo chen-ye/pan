@@ -97,16 +97,7 @@ def process_video_generator(rel_path):
                 for d in result['detections']:
                     if d['conf'] > 0.2:
                         cat_id = d['category']
-
-                        # Skip detections with invalid/unreasonable class IDs
-                       # MegaDetector should only return 1, 2, or 3
-                        if isinstance(cat_id, int) and cat_id > 10:
-                            continue
-                        if isinstance(cat_id, str) and not cat_id.isdigit():
-                            continue
-                        if isinstance(cat_id, str) and int(cat_id) > 10:
-                            continue
-
+                        # Map known classes, label unknown ones for visibility
                         class_name = CLASS_MAPPING.get(cat_id, f'unknown_{cat_id}')
                         x, y, w, h = d['bbox']
                         bbox = [x, y, x + w, y + h]
