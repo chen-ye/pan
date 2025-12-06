@@ -9,8 +9,9 @@ COPY pyproject.toml .
 # Install dependencies into the system environment (no venv needed in container)
 RUN uv pip install --system -r pyproject.toml
 
-# Pre-download MegaDetector v1000 (Cedar)
-RUN curl -L -o md_v1000.pt https://huggingface.co/boquila/megadetector-v1000/resolve/main/MDv1000-cedar.bq
+
+# Dependencies installed via pyproject.toml
+
 
 COPY . .
 

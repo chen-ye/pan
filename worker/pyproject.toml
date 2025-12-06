@@ -13,4 +13,5 @@ dependencies = [
     "psutil",
     "pandas",
     "Pillow",
+    "megadetector",
 ]

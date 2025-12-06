@@ -1,6 +1,8 @@
 
 import { LitElement, css } from "lit";
 import { SignalWatcher, html } from "@lit-labs/signals";
+import { effect } from 'signal-utils/subtle/microtask-effect';
+
 
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 
@@ -16,6 +18,18 @@ import "@shoelace-style/shoelace/dist/components/range/range.js";
 import "@shoelace-style/shoelace/dist/components/tag/tag.js";
 import { State } from "./state.ts";
 import type { TreeNode } from "./types.ts";
+import { setBasePath } from '@shoelace-style/shoelace/dist/utilities/base-path.js';
+
+setBasePath('/shoelace');
+
+function formatDuration(seconds?: number) {
+  if (!seconds) return '';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return (h > 0 ? `${h}h ` : '') + `${m}m ${s}s`;
+}
+
 
 class AppRoot extends SignalWatcher(LitElement) {
 
@@ -138,7 +152,7 @@ class AppRoot extends SignalWatcher(LitElement) {
     #list-col {
       width: var(--list-width);
       border-right: 1px solid var(--sl-color-neutral-200);
-      background: var(--sl-color-neutral-0);
+      background: var(--sl-color-neutral-50);
       display: flex;
       flex-direction: column;
       overflow-y: auto;
@@ -148,7 +162,7 @@ class AppRoot extends SignalWatcher(LitElement) {
       flex: 1;
       display: flex;
       flex-direction: column;
-      background: var(--sl-color-neutral-500);
+      background: var(--sl-color-neutral-200);
       position: relative;
       overflow-y: auto;
     }
@@ -191,7 +205,6 @@ class AppRoot extends SignalWatcher(LitElement) {
     .video-container {
         position: relative;
         width: 100%;
-        background: var(--sl-color-neutral-1000);
         display: flex;
         justify-content: center;
         align-items: center;
@@ -268,7 +281,7 @@ class AppRoot extends SignalWatcher(LitElement) {
       padding: var(--sl-spacing-medium);
       position: sticky;
       top: 0;
-      background: var(--sl-color-neutral-0);
+      background: var(--sl-color-neutral-50);
       z-index: 1;
       border-bottom: 1px solid var(--sl-color-neutral-200);
     }
@@ -340,7 +353,7 @@ class AppRoot extends SignalWatcher(LitElement) {
             <sl-checkbox>Vehicle</sl-checkbox>
             <sl-divider></sl-divider>
              <div class="section-title">Status</div>
-             <sl-checkbox>Processed Only</sl-checkbox>
+             <sl-checkbox .checked=${this.state.filterProcessed.get()} @sl-change=${(e: any) => this.state.setFilterProcessed(e.target.checked)}>Processed Only</sl-checkbox>
         </div>
 
         <!-- List Column -->
@@ -352,6 +365,7 @@ class AppRoot extends SignalWatcher(LitElement) {
                     <div class="tag-container">
                         ${v.processed ? html`<span class="tag processed">Processed</span>` : ''}
                         <span class="tag">${formatSize(v.size)}</span>
+                        ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ''}
                     </div>
                     <div class="video-meta">
                         <span>Video</span>
@@ -380,12 +394,17 @@ class AppRoot extends SignalWatcher(LitElement) {
   }
 
   renderDetail() {
+      console.log('renderDetail');
       const currentPath = this.state.currentVideoPath.get();
       const vidData = this.state.videos.get().find(v => v.path === currentPath);
       const isProcessed = vidData && vidData.processed;
 
       const results = this.state.currentResults.get();
       const playbackSpeed = this.state.playbackSpeed.get();
+
+      effect(() => {
+          console.log('currentPath',  this.state.currentVideoPath.get());
+      })
 
       return html`
         <div class="video-container">
@@ -395,7 +414,7 @@ class AppRoot extends SignalWatcher(LitElement) {
                 autoplay
                 muted
                 loop
-                src="/videos/${currentPath}"
+                src="${window.location.protocol}//${window.location.hostname}:8000/videos/${currentPath}"
                 @loadedmetadata=${this.onVideoLoad}
             ></video>
             <canvas id="overlay-canvas"></canvas>
@@ -404,7 +423,7 @@ class AppRoot extends SignalWatcher(LitElement) {
         <div class="controls-bar">
              <sl-icon name="speedometer"></sl-icon>
              <span class="speed-label">${playbackSpeed}x</span>
-             <sl-range class="speed-slider" min="0.5" max="10" step="0.5" .value=${playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
+             <sl-range class="speed-slider" min="0.5" max="18" step="0.5" .value=${playbackSpeed} @sl-change=${(e) => this.setSpeed(e.target.value)}></sl-range>
 
              <div class="spacer"></div>
 
@@ -417,11 +436,17 @@ class AppRoot extends SignalWatcher(LitElement) {
                  <sl-tag type="success">Processed</sl-tag>
                  <sl-button size="small" @click=${() => this.state.processVideo(currentPath)}>Re-process</sl-button>
              `}
+
+             <sl-button variant="warning" outline @click=${() => this.state.moveVideo(currentPath)}>
+                 <sl-icon slot="prefix" name="cloud-upload"></sl-icon>
+                 Move to Upload
+             </sl-button>
         </div>
 
         <div class="info-panel">
             <h3>Metadata</h3>
             <p><strong>File:</strong> ${currentPath}</p>
+            ${vidData?.duration ? html`<p><strong>Duration:</strong> ${formatDuration(vidData.duration)}</p>` : ''}
             ${results ? html`
                 <p><strong>Detections:</strong> ${results.detections.length}</p>
                 <p><strong>Resolution:</strong> ${results.metadata.width}x${results.metadata.height}</p>
@@ -435,7 +460,7 @@ class AppRoot extends SignalWatcher(LitElement) {
   }
 
   setSpeed(speed: string) {
-    this.state.playbackSpeed.set(parseFloat(speed));
+    this.state.setPlaybackSpeed(parseFloat(speed));
     const video = this.querySelector('#main-video') as HTMLVideoElement;
     if (video) video.playbackRate = parseFloat(speed);
   }
@@ -450,6 +475,7 @@ class AppRoot extends SignalWatcher(LitElement) {
             if (path) newSet.add(path);
       });
       this.state.selectedDirs.set(newSet);
+      this.state.updateUrl();
       this.state.loadVideos(true);
   }
 

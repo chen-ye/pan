@@ -15,6 +15,7 @@ services:
     environment:
       - DATA_DIR=/data
       - WORKER_URL=http://worker:5000
+    restart: unless-stopped
 
   frontend:
     build:
@@ -23,7 +24,7 @@ services:
     working_dir: /app/frontend
     volumes:
       - .:/app
-    command: deno run -A npm:vite --host
+    command: deno run --unstable-no-legacy-abort -A npm:vite --host
     ports:
       - "5173:5173"
     depends_on:

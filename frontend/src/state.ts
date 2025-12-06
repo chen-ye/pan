@@ -18,10 +18,58 @@ export class State {
   selectedDirs = signal(new Set());
   error = signal<string | null>(null);
 
+  constructor() {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('video')) this.currentVideoPath.set(params.get('video'));
+      if (params.has('speed')) this.playbackSpeed.set(parseFloat(params.get('speed')!));
+      if (params.has('processed')) this.filterProcessed.set(params.get('processed') === 'true');
+      if (params.has('dirs')) {
+          const dirs = params.get('dirs')!.split(',');
+          this.selectedDirs.set(new Set(dirs));
+      }
+
+      // Auto-refresh library
+      const evtSource = new EventSource("/api/events");
+      evtSource.addEventListener("update", () => {
+          console.log("Library update received, reloading...");
+          this.loadVideos(true);
+      });
+  }
+
+  updateUrl() {
+      const params = new URLSearchParams();
+      const video = this.currentVideoPath.get();
+      if (video) params.set('video', video);
+
+      const speed = this.playbackSpeed.get();
+      if (speed !== 5.0) params.set('speed', speed.toString());
+
+      const processed = this.filterProcessed.get();
+      if (processed) params.set('processed', 'true');
+
+      const dirs = Array.from(this.selectedDirs.get());
+      if (dirs.length > 0) params.set('dirs', dirs.join(','));
+
+      const newUrl = `${window.location.pathname}?${params.toString()}`;
+      window.history.replaceState({}, '', newUrl);
+  }
+
+  setPlaybackSpeed(speed: number) {
+      this.playbackSpeed.set(speed);
+      this.updateUrl();
+  }
+
+  setFilterProcessed(value: boolean) {
+      this.filterProcessed.set(value);
+      this.updateUrl();
+  }
+
 
   async fetchDirs() {
       console.log("Fetching dirs...");
       this.error.set(null);
+      this.updateUrl();
+      this.updateUrl(); // Sync initial state to URL if needed (e.g. cleaning up empty params)
       try {
           const res = await fetch("/api/dirs");
           if (!res.ok) throw new Error(`Status ${res.status}`);
@@ -62,6 +110,9 @@ export class State {
       this.hasMore.set(this.videos.get().length < data.total);
       this.totalVideos.set(data.total);
 
+      // Fetch durations asynchronously
+      this.fetchDurations(newItems);
+
     } catch (e) {
       console.error("Failed to fetch videos", e);
     } finally {
@@ -72,6 +123,8 @@ export class State {
   async selectVideo(path: string) {
     this.currentVideoPath.set(path);
     this.currentResults.set(null);
+    this.updateUrl();
+    this.updateUrl();
 
     // Find video object to check processed status immediately from list if possible
     const videos = this.videos.get();
@@ -98,6 +151,8 @@ export class State {
         this.currentVideoPath.set(null);
         this.currentResults.set(null);
     }
+    this.updateUrl();
+    this.updateUrl();
   }
 
   toggleDir(path: string, selected: boolean) {
@@ -109,6 +164,8 @@ export class State {
           next.delete(path);
       }
       this.selectedDirs.set(next);
+      this.updateUrl();
+      this.loadVideos(true);
       this.loadVideos(true);
   }
 
@@ -134,6 +191,64 @@ export class State {
           alert("Processing failed: " + e.message);
       } finally {
           if(btn) btn.loading = false;
+      }
+  }
+  async fetchDurations(items: Video[]) {
+      const paths = items.filter(v => v.duration === undefined).map(v => v.path);
+      if (paths.length === 0) return;
+
+      try {
+          const res = await fetch("/api/videos/durations", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ paths })
+          });
+
+          if (res.ok) {
+              const data = await res.json();
+              // Batch update
+              const currentList = this.videos.get();
+              // Create a map for faster lookup
+              const durationMap = new Map(Object.entries(data));
+
+              const updatedList = currentList.map(v => {
+                  if (durationMap.has(v.path)) {
+                      return { ...v, duration: Number(durationMap.get(v.path)) };
+                  }
+                  return v;
+              });
+
+              this.videos.set(updatedList);
+          }
+      } catch (e) {
+          console.error("Failed to fetch durations", e);
+      }
+  }
+
+
+  async moveVideo(path: string) {
+      if (!confirm(`Move ${path} to NVR-upload?`)) return;
+      try {
+           const res = await fetch("/api/videos/move", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ path })
+          });
+          if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.error || res.statusText);
+          }
+          // Remove from local list to reflect immediate change
+          const current = this.videos.get();
+          this.videos.set(current.filter(v => v.path !== path));
+
+          if (this.currentVideoPath.get() === path) {
+              this.currentVideoPath.set(null);
+              this.currentResults.set(null);
+          }
+           this.updateUrl();
+      } catch (e: any) {
+          alert("Move failed: " + e.message);
       }
   }
 }

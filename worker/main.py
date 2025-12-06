@@ -4,6 +4,9 @@ import cv2
 import os
 import json
 import logging
+from PIL import Image
+from megadetector.detection import run_detector
+from megadetector.visualization import visualization_utils as vis_utils
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,25 +15,26 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Load Model
-MODEL_PATH = "md_v1000.pt"
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-logger.info(f"Loading model from {MODEL_PATH} on {device}...")
+# Using MDv5a as the stable default in the v1000 package ecosystem.
+# If a specific v1000 model alias is available (e.g. 'MDV1000'), update here.
+MODEL_VERSION = "mdv1000-cedar"
+logger.info(f"Loading MegaDetector model: {MODEL_VERSION}...")
 
 try:
-    # Load custom model from local file using torch.hub
-    # We use the ultralytics/yolov5 repo to load the custom weights
-    try:
-        model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH)
-    except Exception as e:
-        logger.warning(f"Failed to load model from cache: {e}. Retrying with force_reload=True...")
-        model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH, force_reload=True)
-
+    model = run_detector.load_detector(MODEL_VERSION)
     logger.info("Model loaded successfully.")
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     model = None
 
 DATA_DIR = "/data"
+
+# MD Class mapping
+CLASS_MAPPING = {
+    '1': 'animal',
+    '2': 'person',
+    '3': 'vehicle'
+}
 
 def process_video_file(rel_path):
     if model is None:
@@ -50,7 +54,7 @@ def process_video_file(rel_path):
 
     results_list = []
 
-    # Process 2 frames per second to balance speed and accuracy
+    # Process 2 frames per second
     if fps > 0:
         frame_interval = int(fps / 2)
     else:
@@ -67,23 +71,29 @@ def process_video_file(rel_path):
             break
 
         if frame_count % frame_interval == 0:
-            # Detection
-            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = model(img)
+            # Conversion to PIL for MegaDetector
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
 
-            # Get normalized coordinates
-            # results.xyxyn[0] contains [x1, y1, x2, y2, conf, cls]
-            for *xyxy, conf, cls in results.xyxyn[0].tolist():
-                if conf > 0.2: # Confidence threshold
-                    class_index = int(cls)
-                    class_name = model.names[class_index]
+            # Inference
+            result = model.generate_detections_one_image(pil_img)
+
+            # result['detections'] is a list of dicts: {'category': '1', 'conf': 0.9, 'bbox': [x, y, w, h]}
+            for d in result['detections']:
+                if d['conf'] > 0.2:
+                    cat_id = d['category']
+                    class_name = CLASS_MAPPING.get(cat_id, str(cat_id))
+
+                    # Convert [x, y, w, h] to [x1, y1, x2, y2]
+                    x, y, w, h = d['bbox']
+                    bbox = [x, y, x + w, y + h]
 
                     results_list.append({
                         "frame": frame_count,
                         "timestamp": frame_count / fps if fps > 0 else 0,
                         "category": class_name,
-                        "conf": conf,
-                        "bbox": xyxy # normalized [x1, y1, x2, y2]
+                        "conf": d['conf'],
+                        "bbox": bbox
                     })
 
         frame_count += 1
@@ -134,8 +144,8 @@ def handle_process():
 def status():
     return jsonify({
         "status": "ready" if model else "error",
-        "device": device,
-        "model": MODEL_PATH
+        "device": device if 'device' in globals() else "cuda",
+        "model": MODEL_VERSION
     })
 
 if __name__ == '__main__':

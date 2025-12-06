@@ -9,6 +9,7 @@ export interface Video {
   name: string;
   processed: boolean;
   size: number;
+  duration?: number;
 }
 
 export interface Detection {
