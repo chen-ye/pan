@@ -1,4 +1,4 @@
-import { css, html, LitElement } from "lit";
+import { css, html, LitElement, PropertyValues } from "lit";
 import { SignalWatcher } from "@lit-labs/signals";
 import { State } from "../state.ts";
 import type { Detection } from "../types.ts";
@@ -279,6 +279,8 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const processingStatus = isProcessingCurrent ? job.status : null;
     const processingProgress = isProcessingCurrent ? job.progress : 0;
 
+    const _videoUrl = `/videos/${currentPath}`;
+    const videoUrlMonolithic = `/videos-monolithic/${currentPath}`;
     return html`
       <div class="video-container">
         <div class="media-stack">
@@ -290,7 +292,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
               loop
               preload="metadata"
               crossorigin="anonymous"
-              src="/videos/${currentPath}"
+              src=${videoUrlMonolithic}
               @loadedmetadata="${this.onVideoLoad}"
             >
             </video>

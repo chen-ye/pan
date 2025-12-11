@@ -1,4 +1,5 @@
-import { signal } from "@lit-labs/signals";
+import { signal, computed } from "@lit-labs/signals";
+import { effect } from "signal-utils/subtle/microtask-effect";
 import type SlButton from "@shoelace-style/shoelace/dist/components/button/button.js";
 import type { Detection, GpuStats, Result, TreeNode, Video } from "./types.ts";
 
@@ -46,6 +47,7 @@ export class State {
 
   dirTree = signal<TreeNode[]>([]);
   selectedDirs = signal<Set<string>>(new Set());
+  minimizedDirs = computed(() => this.minimizeDirs(Array.from(this.selectedDirs.get())));
   error = signal<string | null>(null);
 
   gpuStats = signal<GpuStats | null>(null);
@@ -60,8 +62,12 @@ export class State {
     if (params.has("processed")) {
       this.filterProcessed.set(params.get("processed") === "true");
     }
-    if (params.has("processed")) {
-      this.filterProcessed.set(params.get("processed") === "true");
+
+    if (params.has("sort")) {
+      this.sortBy.set(params.get("sort")!);
+    }
+    if (params.has("order")) {
+      this.sortOrder.set(params.get("order")!);
     }
 
     // Load dirs from sessionStorage
@@ -76,6 +82,11 @@ export class State {
     } catch (e) {
       console.warn("Failed to load dirs from session", e);
     }
+
+    // Auto-update URL when state changes
+    effect(() => {
+        this.updateUrl();
+    });
 
     // Auto-refresh library
     const evtSource = new EventSource("/api/events");
@@ -139,6 +150,12 @@ export class State {
     const processed = this.filterProcessed.get();
     if (processed) params.set("processed", "true");
 
+    const sort = this.sortBy.get();
+    if (sort !== "name") params.set("sort", sort);
+
+    const order = this.sortOrder.get();
+    if (order !== "asc") params.set("order", order);
+
     const url = new URL(globalThis.location.href);
     url.search = params.toString();
     globalThis.history.replaceState({}, "", url.toString());
@@ -146,18 +163,15 @@ export class State {
 
   setPlaybackSpeed(speed: number) {
     this.playbackSpeed.set(speed);
-    this.updateUrl();
   }
 
   setFilterProcessed(value: boolean) {
     this.filterProcessed.set(value);
-    this.updateUrl();
   }
 
   async fetchDirs() {
     console.log("Fetching dirs...");
     this.error.set(null);
-    this.updateUrl(); // Sync initial state to URL if needed
     try {
       const res = await fetch("/api/dirs");
       if (!res.ok) throw new Error(`Status ${res.status}`);
@@ -182,7 +196,7 @@ export class State {
     try {
       const page = reset ? 1 : this.currentPage.get();
 
-      const selectedDirs = this.minimizeDirs(Array.from(this.selectedDirs.get()));
+      const selectedDirs = this.minimizedDirs.get();
 
       const payload = {
         page: page,
@@ -275,7 +289,6 @@ export class State {
   async selectVideo(path: string) {
     this.currentVideoPath.set(path);
     this.currentResults.set(null);
-    this.updateUrl();
 
     // Check cache first
     if (this.resultsCache.has(path)) {
@@ -384,7 +397,6 @@ export class State {
     }
     this.selectedDirs.set(next);
     sessionStorage.setItem("selectedDirs", JSON.stringify(Array.from(next)));
-    this.updateUrl();
     this.loadVideos(true);
   }
 
@@ -621,7 +633,6 @@ export class State {
         this.currentVideoPath.set(null);
         this.currentResults.set(null);
       }
-      this.updateUrl();
     } catch (e: unknown) {
       alert("Move failed: " + (e instanceof Error ? e.message : String(e)));
     }
