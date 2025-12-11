@@ -387,16 +387,10 @@ export class State {
     }
   }
 
-  toggleDir(path: string, selected: boolean) {
-    const current = this.selectedDirs.get();
-    const next = new Set(current);
-    if (selected) {
-      next.add(path);
-    } else {
-      next.delete(path);
-    }
-    this.selectedDirs.set(next);
-    sessionStorage.setItem("selectedDirs", JSON.stringify(Array.from(next)));
+  setSelectedDirs(dirs: Set<string>) {
+    this.selectedDirs.set(dirs);
+    const minimized = this.minimizeDirs(Array.from(dirs));
+    sessionStorage.setItem("selectedDirs", JSON.stringify(minimized));
     this.loadVideos(true);
   }
 

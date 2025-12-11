@@ -89,9 +89,8 @@ export class FilterPanel extends SignalWatcher(LitElement) {
       const path = item.getAttribute("value");
       if (path) newSet.add(path);
     });
-    this.state.selectedDirs.set(newSet);
+    this.state.setSelectedDirs(newSet);
     this.state.updateUrl();
-    this.state.loadVideos(true);
   }
 
   renderTreeItems(nodes: TreeNode[]): unknown[] {
