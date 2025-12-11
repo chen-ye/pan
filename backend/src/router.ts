@@ -6,6 +6,7 @@ import { metadataService } from "./services/metadata.ts";
 import { sseService } from "./services/sse.ts";
 import { processingService } from "./services/processing.ts";
 import { getDirTree } from "./services/files.ts";
+import { normalizeLegacyFormat, Detection } from "./utils.ts";
 
 export const router = new Router();
 
@@ -24,6 +25,8 @@ router.post("/api/videos/search", async (ctx) => {
   const page = parseInt(body.page || "1");
   const limit = parseInt(body.limit || "50");
   const dirs = Array.isArray(body.dirs) ? body.dirs : []; // Expect array of strings
+  const tags = Array.isArray(body.tags) ? body.tags : []; // Expect array of strings
+  console.log(`Search request: page=${page}, limit=${limit}, tags=${JSON.stringify(tags)}, dirs=${dirs.length}`);
   const sortBy = body.sort || "name";
   const order = body.order || "asc";
 
@@ -34,6 +37,116 @@ router.post("/api/videos/search", async (ctx) => {
       return dirs.some((dir: string) => v.path === dir || v.path.startsWith(dir + "/"));
     });
   }
+
+  // Helper function to map a single video entry to include processed status and classifications
+  const mapVideoEntry = async (v: any) => { // v is a VideoEntry from libraryService
+    const jsonPath = v.fullPath + ".json";
+    const legacyJsonPath = v.fullPath.substring(0, v.fullPath.lastIndexOf(".")) + ".json";
+
+    let processed = false;
+    try {
+      const info = await Deno.stat(jsonPath);
+      processed = info.size > 0;
+    } catch {
+        try {
+            const info = await Deno.stat(legacyJsonPath);
+            processed = info.size > 0;
+        } catch { /* File doesn't exist */ }
+    }
+
+    let classifications: string[] = [];
+
+    if (processed) {
+        try {
+            try {
+                const text = await Deno.readTextFile(jsonPath);
+                let data = JSON.parse(text);
+                data = normalizeLegacyFormat(data);
+                if (data.detections) {
+                     const cats = new Set<string>();
+                     data.detections.forEach((d: Detection) => cats.add(d.category));
+                     classifications = Array.from(cats).sort();
+                }
+            } catch {
+                 try {
+                     const text = await Deno.readTextFile(legacyJsonPath);
+                     let data = JSON.parse(text);
+                     data = normalizeLegacyFormat(data);
+                     if (data.detections) {
+                         const cats = new Set<string>();
+                         data.detections.forEach((d: Detection) => cats.add(d.category));
+                         classifications = Array.from(cats).sort();
+                     }
+                 } catch { /* Failed to read/parse both */ }
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Add 'Upload' tag if in upload directory
+    if (v.path.startsWith("NVR-upload/") || v.path.includes("/NVR-upload/")) {
+        classifications.push("Upload");
+        // Ensure unique just in case, though unlikely to be duplicate unless manual JSON has it
+        classifications = Array.from(new Set(classifications)).sort();
+    }
+
+    return {
+      path: v.path,
+      name: v.name,
+      processed: processed,
+      size: v.size,
+      classifications: classifications,
+      duration: v.duration, // Ensure duration is passed if we add it to VideoEntry later or fetch it here
+      mtime: v.mtime, // Needed for sorting
+    };
+  };
+
+  if (tags.length > 0) {
+      // Expensive path: Map ALL filtered videos to get classification data, then filter by tags, then sort, then slice.
+      const allMapped = await Promise.all(filteredVideos.map(mapVideoEntry));
+
+      console.log(`Filtering ${allMapped.length} videos by tags: ${JSON.stringify(tags)}`);
+
+      const resultVideos = allMapped.filter(v => {
+          if (tags.includes("Unprocessed") && !v.processed) return true;
+          if (tags.includes("Blank") && v.processed && v.classifications.length === 0) return true;
+          if (v.processed && v.classifications.length > 0) {
+              // Check if any of the video's classifications match the selected tags
+              // deno-lint-ignore no-explicit-any
+              if (tags.some((t: any) => v.classifications.includes(t))) return true;
+          }
+          return false;
+      });
+
+      console.log(`Filter result: ${resultVideos.length} videos match`);
+
+      // Sort after filtering by tags
+      resultVideos.sort((a, b) => {
+        let cmp = 0;
+        if (sortBy === "size") {
+            cmp = a.size - b.size;
+        } else if (sortBy === "date") {
+            cmp = a.mtime - b.mtime;
+        } else {
+            cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        return order === "desc" ? -cmp : cmp;
+      });
+
+      const total = resultVideos.length;
+      const startIndex = (page - 1) * limit;
+      const endIndex = startIndex + limit;
+      const pageVideos = resultVideos.slice(startIndex, endIndex);
+
+      ctx.response.body = {
+        items: pageVideos,
+        total: total,
+        page: page,
+        limit: limit,
+      };
+      return; // Return early for tag path
+  }
+
+  // --- No Tags: Optimized Path (Sort then Slice then Map) ---
 
   // Sorting
   filteredVideos.sort((a, b) => {
@@ -70,11 +183,51 @@ router.post("/api/videos/search", async (ctx) => {
         } catch { /* File doesn't exist */ }
     }
 
+    let classifications: string[] = [];
+
+    if (processed) {
+        try {
+            // Read and parse result file to attempt to get classifications
+            // This might be slow for many files, but necessary for the requirement
+            // We'll trust the size check above that file exists
+            try {
+                const text = await Deno.readTextFile(jsonPath);
+                let data = JSON.parse(text);
+                data = normalizeLegacyFormat(data);
+
+                if (data.detections) {
+                     const cats = new Set<string>();
+                     data.detections.forEach((d: Detection) => cats.add(d.category));
+                     classifications = Array.from(cats).sort();
+                }
+            } catch {
+                 // Try legacy path if standard failed
+                 try {
+                     const text = await Deno.readTextFile(legacyJsonPath);
+                     let data = JSON.parse(text);
+                     data = normalizeLegacyFormat(data);
+
+                     if (data.detections) {
+                         const cats = new Set<string>();
+                         data.detections.forEach((d: Detection) => cats.add(d.category));
+                         classifications = Array.from(cats).sort();
+                     }
+                 } catch {
+                     // Failed to read/parse both
+                 }
+            }
+        } catch {
+            // ignore
+        }
+    }
+
     return {
       path: v.path,
       name: v.name,
       processed: processed,
       size: v.size,
+      classifications: classifications,
+      duration: v.duration // Ensure duration is passed if we add it to VideoEntry later or fetch it here
     };
   }));
 
@@ -188,9 +341,10 @@ router.get("/api/results/:path*", async (ctx) => {
           // If the user says "syntax error", the file has content but is bad.
           // Let's try to parse it. It's safe for most result files.
           const text = await Deno.readTextFile(fullPath);
-          JSON.parse(text); // Will throw if invalid
+          let json = JSON.parse(text); // Will throw if invalid
+          json = normalizeLegacyFormat(json);
 
-          ctx.response.body = text;
+          ctx.response.body = JSON.stringify(json);
           ctx.response.type = "application/json";
           return true;
       } catch {

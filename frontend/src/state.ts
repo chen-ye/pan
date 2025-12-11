@@ -1,7 +1,7 @@
 import { signal, computed } from "@lit-labs/signals";
 import { effect } from "signal-utils/subtle/microtask-effect";
 import type SlButton from "@shoelace-style/shoelace/dist/components/button/button.js";
-import type { Detection, GpuStats, Result, TreeNode, Video } from "./types.ts";
+import type { GpuStats, Result, TreeNode, Video } from "./types.ts";
 
 interface LegacyAnnotation {
   img_id?: string;
@@ -34,7 +34,8 @@ export class State {
   currentVideoPath = signal<string | null>(null);
   currentResults = signal<Result | null>(null);
   playbackSpeed = signal(5.0);
-  filterProcessed = signal(false);
+  // filterProcessed = signal(false); // Deprecated
+  selectedTags = signal<Set<string>>(new Set());
 
   showFilters = signal(false);
 
@@ -59,8 +60,9 @@ export class State {
     if (params.has("speed")) {
       this.playbackSpeed.set(parseFloat(params.get("speed")!));
     }
-    if (params.has("processed")) {
-      this.filterProcessed.set(params.get("processed") === "true");
+    if (params.has("tags")) {
+        const tags = params.get("tags")!.split(",");
+        this.selectedTags.set(new Set(tags));
     }
 
     if (params.has("sort")) {
@@ -147,8 +149,8 @@ export class State {
     const speed = this.playbackSpeed.get();
     if (speed !== 5.0) params.set("speed", speed.toString());
 
-    const processed = this.filterProcessed.get();
-    if (processed) params.set("processed", "true");
+    const tags = Array.from(this.selectedTags.get());
+    if (tags.length > 0) params.set("tags", tags.join(","));
 
     const sort = this.sortBy.get();
     if (sort !== "name") params.set("sort", sort);
@@ -165,9 +167,17 @@ export class State {
     this.playbackSpeed.set(speed);
   }
 
-  setFilterProcessed(value: boolean) {
-    this.filterProcessed.set(value);
+  toggleTag(tag: string) {
+      const current = this.selectedTags.get();
+      const next = new Set(current);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      this.selectedTags.set(next);
+      this.updateUrl();
+      this.loadVideos(true);
   }
+
+  // setFilterProcessed(value: boolean) { ... } // Removed
 
   async fetchDirs() {
     console.log("Fetching dirs...");
@@ -203,7 +213,8 @@ export class State {
         limit: 50,
         sort: this.sortBy.get(),
         order: this.sortOrder.get(),
-        dirs: selectedDirs
+        dirs: selectedDirs,
+        tags: Array.from(this.selectedTags.get())
       };
 
       const res = await fetch("/api/videos/search", {
@@ -243,46 +254,7 @@ export class State {
     }
   }
 
-  // deno-lint-ignore no-explicit-any
-  normalizeLegacyFormat(data: any): any {
-    // Check if data has legacy format (annotations array)
-    if (data.annotations && Array.isArray(data.annotations)) {
-      console.log("Converting legacy format to new format");
-      const detections: Detection[] = [];
 
-      data.annotations.forEach((ann: LegacyAnnotation) => {
-        const frameNum = parseInt(ann.img_id || "0");
-        const bboxes = ann.bbox || [];
-        const categories = ann.category || [];
-        const confidences = ann.confidence || [];
-
-        // Each frame can have multiple detections
-        for (let i = 0; i < bboxes.length; i++) {
-          detections.push({
-            frame: frameNum,
-            timestamp: frameNum / 2, // Assume 2fps processing
-            category: categories[i] || "unknown",
-            conf: confidences[i] || 0,
-            bbox: bboxes[i] || [0, 0, 0, 0],
-          });
-        }
-      });
-
-      return {
-        video: data.video || "unknown",
-        metadata: data.metadata || {
-          fps: 2,
-          total_frames: data.annotations.length,
-          width: 1920,
-          height: 1080,
-        },
-        detections: detections,
-      };
-    }
-
-    // Already in new format
-    return data;
-  }
 
   resultsCache = new Map<string, Result>();
 
@@ -307,7 +279,7 @@ export class State {
         if (res.ok) {
           try {
             let data = await res.json();
-            data = this.normalizeLegacyFormat(data);
+            // data = this.normalizeLegacyFormat(data); // Backend handles this now
             this.resultsCache.set(path, data);
             this.currentResults.set(data);
           } catch (e) {
@@ -349,8 +321,8 @@ export class State {
     try {
         const res = await fetch(`/api/results/${path}`);
         if (res.ok) {
-            let data = await res.json();
-            data = this.normalizeLegacyFormat(data);
+            const data = await res.json();
+            // data = this.normalizeLegacyFormat(data);
             this.resultsCache.set(path, data);
         }
     } catch {

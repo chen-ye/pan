@@ -271,7 +271,9 @@ export class VideoList extends SignalWatcher(LitElement) {
                  @click="${() => this.state.selectVideo(v.path)}">
               <div class="video-title" title="${v.name}">${v.name}</div>
               <div class="tag-container">
-                ${v.processed ? html`<span class="tag processed">Processed</span>` : ""}
+                ${!v.processed ? html`<span class="tag">Unprocessed</span>` : ""}
+                ${v.processed && (!v.classifications || v.classifications.length === 0) ? html`<span class="tag">Blank</span>` : ""}
+                ${v.processed && v.classifications ? v.classifications.map(c => html`<span class="tag processed">${c}</span>`) : ""}
                 ${isProcessing ? html`<span class="tag progress">${Math.round((job?.progress || 0) * 100)}%</span>` : ""}
                 <span class="tag">${formatSize(v.size)}</span>
                 ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ""}

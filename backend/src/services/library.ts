@@ -1,6 +1,7 @@
 import { ensureDir, walk } from "@std/fs";
 import { dirname, extname, join, relative } from "@std/path";
 import { CONFIG } from "../config.ts";
+import { normalizeLegacyFormat, Detection } from "../utils.ts";
 import { sseService } from "./sse.ts";
 
 export interface VideoEntry {
@@ -9,6 +10,9 @@ export interface VideoEntry {
   fullPath: string;
   size: number;
   mtime: number;
+  duration?: number;
+  processed?: boolean;
+  classifications?: string[];
 }
 
 export class LibraryService {
@@ -33,12 +37,63 @@ export class LibraryService {
           const relPath = relative(CONFIG.DATA_DIR, entry.path);
           try {
              const info = await Deno.stat(entry.path);
+
+             // Check metadata
+             const jsonPath = entry.path + ".json";
+             const legacyJsonPath = entry.path.substring(0, entry.path.lastIndexOf(".")) + ".json";
+
+             let processed = false;
+             try {
+                const jInfo = await Deno.stat(jsonPath);
+                processed = jInfo.size > 0;
+             } catch {
+                 try {
+                     const jInfo = await Deno.stat(legacyJsonPath);
+                     processed = jInfo.size > 0;
+                 } catch { }
+             }
+
+             let classifications: string[] = [];
+             if (processed) {
+                 try {
+                     try {
+                        const text = await Deno.readTextFile(jsonPath);
+                        let data = JSON.parse(text);
+                        data = normalizeLegacyFormat(data);
+                        if (data.detections) {
+                            const cats = new Set<string>();
+                            data.detections.forEach((d: Detection) => cats.add(d.category));
+                            classifications = Array.from(cats).sort();
+                        }
+                     } catch {
+                         try {
+                            const text = await Deno.readTextFile(legacyJsonPath);
+                            let data = JSON.parse(text);
+                            data = normalizeLegacyFormat(data);
+                            if (data.detections) {
+                                const cats = new Set<string>();
+                                data.detections.forEach((d: Detection) => cats.add(d.category));
+                                classifications = Array.from(cats).sort();
+                            }
+                         } catch { }
+                     }
+                 } catch { }
+             }
+
+             // Add 'Upload' tag if in upload directory
+             if (relPath.startsWith("NVR-upload/") || relPath.includes("/NVR-upload/")) {
+                classifications.push("Upload");
+                classifications = Array.from(new Set(classifications)).sort();
+             }
+
              tempLib.push({
                path: relPath,
                name: entry.name,
                fullPath: entry.path,
                size: info.size,
                mtime: info.mtime?.getTime() || 0,
+               processed,
+               classifications
              });
           } catch {
              // Skip if stat fails

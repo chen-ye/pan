@@ -65,17 +65,15 @@ export class FilterPanel extends SignalWatcher(LitElement) {
         `}
 
       <sl-divider></sl-divider>
-      <div class="section-title">Classifications</div>
-      <sl-checkbox checked>All</sl-checkbox>
-      <sl-checkbox>Animal</sl-checkbox>
-      <sl-checkbox>Person</sl-checkbox>
-      <sl-checkbox>Vehicle</sl-checkbox>
       <sl-divider></sl-divider>
-      <div class="section-title">Status</div>
-      <sl-checkbox .checked="${this.state.filterProcessed
-        .get()}" @sl-change="${(e: Event) =>
-        this.state.setFilterProcessed((e.target as HTMLInputElement).checked)}"
-      >Processed Only</sl-checkbox>
+      <div class="section-title">Status/Classifications</div>
+
+      ${['Unprocessed', 'Upload', 'Blank', 'Animal', 'Person', 'Vehicle'].map(tag => html`
+        <sl-checkbox
+            .checked="${this.state.selectedTags.get().has(tag)}"
+            @sl-change="${() => this.state.toggleTag(tag)}"
+        >${tag}</sl-checkbox>
+      `)}
     `;
   }
 
