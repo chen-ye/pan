@@ -27,6 +27,7 @@ interface VideosResponse {
   total: number;
   page: number;
   limit: number;
+  hasMore?: boolean;
 }
 
 export class State {
@@ -242,7 +243,11 @@ export class State {
         this.currentPage.set(page + 1);
       }
 
-      this.hasMore.set(this.videos.get().length < data.total);
+      if (data.hasMore !== undefined) {
+          this.hasMore.set(data.hasMore);
+      } else {
+          this.hasMore.set(this.videos.get().length < data.total);
+      }
       this.totalVideos.set(data.total);
 
       // Fetch durations asynchronously

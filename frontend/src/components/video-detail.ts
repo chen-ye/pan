@@ -1,4 +1,4 @@
-import { css, html, LitElement, PropertyValues } from "lit";
+import { css, html, LitElement } from "lit";
 import { SignalWatcher } from "@lit-labs/signals";
 import { State } from "../state.ts";
 import type { Detection } from "../types.ts";
@@ -20,8 +20,13 @@ export class VideoDetail extends SignalWatcher(LitElement) {
   state!: State;
   animReq: number | undefined;
 
+  // Internal state to track if we switched to seekable source
+  useSeekableSource = false;
+  lastVideoPath: string | null = null;
+
   static override properties = {
     state: { attribute: false },
+    useSeekableSource: { state: true },
   };
 
   static override styles = [css`
@@ -268,6 +273,16 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       `;
     }
 
+    // Reset seekable source if path changed
+    if (currentPath !== this.lastVideoPath) {
+        this.useSeekableSource = false;
+        this.lastVideoPath = currentPath;
+
+        // Clear thumbnails from previous video
+        const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery");
+        if (gallery) gallery.innerHTML = "";
+    }
+
     const vidData = this.state.videos.get().find((v) => v.path === currentPath);
     const isProcessed = vidData && vidData.processed;
 
@@ -279,8 +294,8 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const processingStatus = isProcessingCurrent ? job.status : null;
     const processingProgress = isProcessingCurrent ? job.progress : 0;
 
-    const _videoUrl = `/videos/${currentPath}`;
-    const videoUrlMonolithic = `/videos-monolithic/${currentPath}`;
+    const videoSrc = this.useSeekableSource ? `/videos/${currentPath}` : `/videos-monolithic/${currentPath}`;
+
     return html`
       <div class="video-container">
         <div class="media-stack">
@@ -292,7 +307,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
               loop
               preload="metadata"
               crossorigin="anonymous"
-              src=${videoUrlMonolithic}
+              src=${videoSrc}
               @loadedmetadata="${this.onVideoLoad}"
             >
             </video>
@@ -419,73 +434,169 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d")!;
 
-    // Pause video during thumbnail generation
-    const wasPlaying = !video.paused;
-    video.pause();
-    const originalTime = video.currentTime;
+    // Use a separate, hidden video element for thumbnail generation
+    // This allows us to use the seekable /videos/ endpoint even if the main player
+    // is using the non-seekable /videos-monolithic/ endpoint.
+    const tempVideo = document.createElement("video");
+    tempVideo.crossOrigin = "anonymous";
+    tempVideo.src = `/videos/${this.state.currentVideoPath.get()}`;
+    tempVideo.muted = true;
+    tempVideo.playsInline = true;
+    tempVideo.preload = "auto";
 
+    // Attach to DOM but hide it to ensure browser prioritizes loading
+    tempVideo.style.position = "absolute";
+    tempVideo.style.visibility = "hidden";
+    tempVideo.style.pointerEvents = "none";
+    tempVideo.style.zIndex = "-1";
+    this.shadowRoot?.appendChild(tempVideo);
+
+    // Helper to cleanup
+    const cleanup = () => {
+        tempVideo.pause();
+        tempVideo.src = "";
+        tempVideo.remove();
+    };
+
+    const errors: string[] = [];
     try {
-      for (const det of uniqueDetections) {
-        try {
-            await new Promise<void>((resolve, reject) => {
-              const timeout = setTimeout(() => reject(new Error("Seek timeout")), 2000);
-
-              const onSeeked = () => {
+        // Wait for metadata to load so we can seek
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("Timeout loading video metadata")), 15000);
+            tempVideo.onloadedmetadata = () => {
                 clearTimeout(timeout);
                 resolve();
-              };
+            };
+            tempVideo.onerror = () => {
+                 clearTimeout(timeout);
+                 reject(new Error("Failed to load video for processing"));
+            };
+        });
 
-              video.addEventListener("seeked", onSeeked, { once: true });
-              video.currentTime = det.timestamp;
-            });
+        // We don't need to play the video, just seek
+        for (const det of uniqueDetections) {
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    const timeout = setTimeout(() => reject(new Error("Seek timeout")), 5000);
 
-            // Calculate crop (normalized bbox to pixels)
-            const [x1, y1, x2, y2] = det.bbox;
-            const vw = video.videoWidth;
-            const vh = video.videoHeight;
+                    const onSeeked = () => {
+                        clearTimeout(timeout);
+                        resolve();
+                    };
 
-            const sx = Math.max(0, Math.floor(x1 * vw));
-            const sy = Math.max(0, Math.floor(y1 * vh));
-            const sw = Math.min(vw - sx, Math.ceil((x2 - x1) * vw));
-            const sh = Math.min(vh - sy, Math.ceil((y2 - y1) * vh));
+                    // Handle seek errors
+                    const onError = () => {
+                         clearTimeout(timeout);
+                         reject(new Error("Video error during seek"));
+                    };
 
-            if (sw > 0 && sh > 0) {
-              canvas.width = sw;
-              canvas.height = sh;
-              ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
-              thumbnails.push({ url: canvas.toDataURL("image/jpeg", 0.7), det });
+                    tempVideo.addEventListener("seeked", onSeeked, { once: true });
+                    tempVideo.addEventListener("error", onError, { once: true });
+                    tempVideo.currentTime = det.timestamp;
+                });
+
+                // Calculate crop
+                const [x1, y1, x2, y2] = det.bbox;
+                const vw = tempVideo.videoWidth;
+                const vh = tempVideo.videoHeight;
+
+                // Check for absolute vs normalized coordinates
+                // If coordinates are > 1.1, assume they are absolute pixels
+                const isAbsolute = x1 > 1.1 || y1 > 1.1 || x2 > 1.1 || y2 > 1.1;
+
+                let sx, sy, sw, sh;
+
+                if (isAbsolute) {
+                    // console.warn(`Detected absolute coordinates for frame ${det.frame}:`, det.bbox);
+                    sx = x1;
+                    sy = y1;
+                    sw = x2 - x1;
+                    sh = y2 - y1;
+                } else {
+                    sx = x1 * vw;
+                    sy = y1 * vh;
+                    sw = (x2 - x1) * vw;
+                    sh = (y2 - y1) * vh;
+                }
+
+                // Integer pixels
+                sx = Math.floor(sx);
+                sy = Math.floor(sy);
+                sw = Math.ceil(sw);
+                sh = Math.ceil(sh);
+
+                // Clamp to video dimensions
+                sx = Math.max(0, Math.min(sx, vw - 1));
+                sy = Math.max(0, Math.min(sy, vh - 1));
+
+                // Ensure width/height don't exceed bounds
+                sw = Math.min(sw, vw - sx);
+                sh = Math.min(sh, vh - sy);
+
+                if (sw > 0 && sh > 0) {
+                    canvas.width = sw;
+                    canvas.height = sh;
+                    ctx.drawImage(tempVideo, sx, sy, sw, sh, 0, 0, sw, sh);
+                    thumbnails.push({ url: canvas.toDataURL("image/jpeg", 0.7), det });
+                } else {
+                    errors.push(`Invalid dimensions for frame ${det.frame}: ${sw}x${sh} (bbox: ${det.bbox.map(n => n.toFixed(2))})`);
+                }
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.warn(`Failed to generate thumbnail for frame ${det.frame}:`, e);
+                errors.push(`Frame ${det.frame}: ${msg}`);
             }
-        } catch (e) {
-            console.warn(`Failed to generate thumbnail for frame ${det.frame}:`, e);
-        }
       }
     } catch (e) {
       console.error("Thumbnail generation failed:", e);
       gallery.innerHTML = `<p style="color:var(--sl-color-danger-600); text-align:center;">Failed to generate thumbnails: ${e instanceof Error ? e.message : String(e)}</p>`;
       return;
     } finally {
-      // Restore video state
-      video.currentTime = originalTime;
-      // Wait for seek to complete before playing to avoid jumping
-      await new Promise<void>(r => {
-          video.addEventListener("seeked", () => r(), { once: true });
-      });
-      if (wasPlaying) video.play();
+      cleanup();
     }
 
     // Render thumbnails
     gallery.innerHTML = "";
     if (thumbnails.length === 0) {
-        gallery.innerHTML = '<p style="text-align:center;">No thumbnails could be generated.</p>';
+        let msg = "No thumbnails could be generated.";
+        if (errors.length > 0) {
+            msg += "<br><br>Errors:<br>" + errors.slice(0, 5).join("<br>") + (errors.length > 5 ? `<br>...and ${errors.length - 5} more` : "");
+        }
+        gallery.innerHTML = `<p style="text-align:center; color: var(--sl-color-neutral-600);">${msg}</p>`;
         return;
     }
 
     thumbnails.forEach(({ url, det }) => {
       const item = document.createElement("div");
       item.className = "thumbnail-item";
-      item.onclick = () => {
-        video.currentTime = det.timestamp;
-        video.scrollIntoView({ behavior: "smooth", block: "center" });
+      // When clicking a thumbnail, seek the MAIN video
+      item.onclick = async () => {
+         const mainVideo = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
+
+         // If we haven't switched to seekable source yet, do it now
+         if (!this.useSeekableSource) {
+             this.useSeekableSource = true;
+             this.requestUpdate();
+
+             // Wait for update cycle and potential reload
+             await this.updateComplete;
+
+             // Wait for loadedmetadata before seeking
+             if (mainVideo && mainVideo.readyState < 1) { // HAVE_METADATA = 1
+                 mainVideo.addEventListener("loadedmetadata", () => {
+                     mainVideo.currentTime = det.timestamp;
+                     mainVideo.play();
+                 }, { once: true });
+             } else {
+                 mainVideo.currentTime = det.timestamp;
+                 mainVideo.play();
+             }
+         } else {
+             // Already seekable, just seek
+             mainVideo.currentTime = det.timestamp;
+             mainVideo.scrollIntoView({ behavior: "smooth", block: "center" });
+             mainVideo.play();
+         }
       };
 
       const img = document.createElement("img");

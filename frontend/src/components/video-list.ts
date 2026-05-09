@@ -47,6 +47,9 @@ export class VideoList extends SignalWatcher(LitElement) {
       color: var(--sl-color-neutral-500);
       font-weight: 600;
       margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     .list-header {
       padding: var(--sl-spacing-medium);
@@ -162,6 +165,9 @@ export class VideoList extends SignalWatcher(LitElement) {
     }
     .list-header .section-title {
         margin: 0;
+        display: flex;
+        align-items: center;
+        gap: var(--sl-spacing-x-small);
     }
 
     /* Mobile responsive */
@@ -211,7 +217,10 @@ export class VideoList extends SignalWatcher(LitElement) {
     return html`
       <div class="list-header">
         <div class="header-row">
-            <div class="section-title">Videos (${this.state.totalVideos.get()})</div>
+            <div class="section-title">
+                Videos (${this.state.totalVideos.get()})
+                ${this.state.isLoading.get() ? html`<sl-spinner style="font-size: 1rem;"></sl-spinner>` : ''}
+            </div>
 
             <sl-dropdown>
               <sl-button slot="trigger" size="small" caret variant="text">

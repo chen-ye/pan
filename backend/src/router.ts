@@ -6,7 +6,7 @@ import { metadataService } from "./services/metadata.ts";
 import { sseService } from "./services/sse.ts";
 import { processingService } from "./services/processing.ts";
 import { getDirTree } from "./services/files.ts";
-import { normalizeLegacyFormat, Detection } from "./utils.ts";
+import { normalizeLegacyFormat } from "./utils.ts";
 
 export const router = new Router();
 
@@ -26,7 +26,6 @@ router.post("/api/videos/search", async (ctx) => {
   const limit = parseInt(body.limit || "50");
   const dirs = Array.isArray(body.dirs) ? body.dirs : []; // Expect array of strings
   const tags = Array.isArray(body.tags) ? body.tags : []; // Expect array of strings
-  console.log(`Search request: page=${page}, limit=${limit}, tags=${JSON.stringify(tags)}, dirs=${dirs.length}`);
   const sortBy = body.sort || "name";
   const order = body.order || "asc";
 
@@ -38,117 +37,10 @@ router.post("/api/videos/search", async (ctx) => {
     });
   }
 
-  // Helper function to map a single video entry to include processed status and classifications
-  const mapVideoEntry = async (v: any) => { // v is a VideoEntry from libraryService
-    const jsonPath = v.fullPath + ".json";
-    const legacyJsonPath = v.fullPath.substring(0, v.fullPath.lastIndexOf(".")) + ".json";
+  // Simplification: LibraryService now caches metadata, so we don't need to read files here.
+  // We can just filter directly on the video objects.
 
-    let processed = false;
-    try {
-      const info = await Deno.stat(jsonPath);
-      processed = info.size > 0;
-    } catch {
-        try {
-            const info = await Deno.stat(legacyJsonPath);
-            processed = info.size > 0;
-        } catch { /* File doesn't exist */ }
-    }
-
-    let classifications: string[] = [];
-
-    if (processed) {
-        try {
-            try {
-                const text = await Deno.readTextFile(jsonPath);
-                let data = JSON.parse(text);
-                data = normalizeLegacyFormat(data);
-                if (data.detections) {
-                     const cats = new Set<string>();
-                     data.detections.forEach((d: Detection) => cats.add(d.category));
-                     classifications = Array.from(cats).sort();
-                }
-            } catch {
-                 try {
-                     const text = await Deno.readTextFile(legacyJsonPath);
-                     let data = JSON.parse(text);
-                     data = normalizeLegacyFormat(data);
-                     if (data.detections) {
-                         const cats = new Set<string>();
-                         data.detections.forEach((d: Detection) => cats.add(d.category));
-                         classifications = Array.from(cats).sort();
-                     }
-                 } catch { /* Failed to read/parse both */ }
-            }
-        } catch { /* ignore */ }
-    }
-
-    // Add 'Upload' tag if in upload directory
-    if (v.path.startsWith("NVR-upload/") || v.path.includes("/NVR-upload/")) {
-        classifications.push("Upload");
-        // Ensure unique just in case, though unlikely to be duplicate unless manual JSON has it
-        classifications = Array.from(new Set(classifications)).sort();
-    }
-
-    return {
-      path: v.path,
-      name: v.name,
-      processed: processed,
-      size: v.size,
-      classifications: classifications,
-      duration: v.duration, // Ensure duration is passed if we add it to VideoEntry later or fetch it here
-      mtime: v.mtime, // Needed for sorting
-    };
-  };
-
-  if (tags.length > 0) {
-      // Expensive path: Map ALL filtered videos to get classification data, then filter by tags, then sort, then slice.
-      const allMapped = await Promise.all(filteredVideos.map(mapVideoEntry));
-
-      console.log(`Filtering ${allMapped.length} videos by tags: ${JSON.stringify(tags)}`);
-
-      const resultVideos = allMapped.filter(v => {
-          if (tags.includes("Unprocessed") && !v.processed) return true;
-          if (tags.includes("Blank") && v.processed && v.classifications.length === 0) return true;
-          if (v.processed && v.classifications.length > 0) {
-              // Check if any of the video's classifications match the selected tags
-              // deno-lint-ignore no-explicit-any
-              if (tags.some((t: any) => v.classifications.includes(t))) return true;
-          }
-          return false;
-      });
-
-      console.log(`Filter result: ${resultVideos.length} videos match`);
-
-      // Sort after filtering by tags
-      resultVideos.sort((a, b) => {
-        let cmp = 0;
-        if (sortBy === "size") {
-            cmp = a.size - b.size;
-        } else if (sortBy === "date") {
-            cmp = a.mtime - b.mtime;
-        } else {
-            cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        }
-        return order === "desc" ? -cmp : cmp;
-      });
-
-      const total = resultVideos.length;
-      const startIndex = (page - 1) * limit;
-      const endIndex = startIndex + limit;
-      const pageVideos = resultVideos.slice(startIndex, endIndex);
-
-      ctx.response.body = {
-        items: pageVideos,
-        total: total,
-        page: page,
-        limit: limit,
-      };
-      return; // Return early for tag path
-  }
-
-  // --- No Tags: Optimized Path (Sort then Slice then Map) ---
-
-  // Sorting
+  // Sort ALL candidates first (metadata sort only, no tag info yet)
   filteredVideos.sort((a, b) => {
     let cmp = 0;
     if (sortBy === "size") {
@@ -161,81 +53,69 @@ router.post("/api/videos/search", async (ctx) => {
     return order === "desc" ? -cmp : cmp;
   });
 
-  const total = filteredVideos.length;
   const startIndex = (page - 1) * limit;
-  const endIndex = startIndex + limit;
-  const pageVideos = filteredVideos.slice(startIndex, endIndex);
+  const pageItems: any[] = [];
+  let matchesFound = 0;
+  let hasMore = false;
 
-  const mappedVideos = await Promise.all(pageVideos.map(async (v) => {
-    const jsonPath = v.fullPath + ".json";
-    const legacyJsonPath = v.fullPath.substring(0, v.fullPath.lastIndexOf(".")) + ".json"; // Remove ext, add .json
+  // Lazy Scan
+  for (const v of filteredVideos) {
+      // 1. Enrich (load tags)
+      await libraryService.enrichEntry(v);
 
-    let processed = false;
-    try {
-      // Check if .json file exists
-      const info = await Deno.stat(jsonPath);
-      processed = info.size > 0;
-    } catch {
-        // Try legacy format (video.json instead of video.mp4.json)
-        try {
-            const info = await Deno.stat(legacyJsonPath);
-            processed = info.size > 0;
-        } catch { /* File doesn't exist */ }
-    }
+      // 2. Filter by Tags
+      let match = true;
+      if (tags.length > 0) {
+          match = false;
+          if (tags.includes("Unprocessed") && !v.processed) match = true;
+          else if (tags.includes("Blank") && v.processed && (!v.classifications || v.classifications.length === 0)) match = true;
+          else if (v.processed && v.classifications && v.classifications.length > 0) {
+              // deno-lint-ignore no-explicit-any
+              if (tags.some((t: any) => v.classifications?.includes(t))) match = true;
+          }
+      }
 
-    let classifications: string[] = [];
+      if (match) {
+          if (matchesFound < startIndex) {
+              matchesFound++;
+              continue;
+          }
 
-    if (processed) {
-        try {
-            // Read and parse result file to attempt to get classifications
-            // This might be slow for many files, but necessary for the requirement
-            // We'll trust the size check above that file exists
-            try {
-                const text = await Deno.readTextFile(jsonPath);
-                let data = JSON.parse(text);
-                data = normalizeLegacyFormat(data);
+          pageItems.push(v);
+          // matchesFound not incremented for page items to keep logic simpler, we just track array
 
-                if (data.detections) {
-                     const cats = new Set<string>();
-                     data.detections.forEach((d: Detection) => cats.add(d.category));
-                     classifications = Array.from(cats).sort();
-                }
-            } catch {
-                 // Try legacy path if standard failed
-                 try {
-                     const text = await Deno.readTextFile(legacyJsonPath);
-                     let data = JSON.parse(text);
-                     data = normalizeLegacyFormat(data);
+          if (pageItems.length > limit) {
+              pageItems.pop(); // Remove the extra one
+              hasMore = true;
+              break;
+          }
+      }
+  }
 
-                     if (data.detections) {
-                         const cats = new Set<string>();
-                         data.detections.forEach((d: Detection) => cats.add(d.category));
-                         classifications = Array.from(cats).sort();
-                     }
-                 } catch {
-                     // Failed to read/parse both
-                 }
-            }
-        } catch {
-            // ignore
-        }
-    }
-
+  // Map for response
+  const mappedVideos = pageItems.map((v) => {
     return {
       path: v.path,
       name: v.name,
-      processed: processed,
+      processed: v.processed || false,
       size: v.size,
-      classifications: classifications,
-      duration: v.duration // Ensure duration is passed if we add it to VideoEntry later or fetch it here
+      classifications: v.classifications || [],
+      duration: v.duration
     };
-  }));
+  });
+
+  // Total will be reported as the cumulative count of videos loaded so far + current page
+  // The frontend treats 'total' as the global count for pagination.
+  // Since we don't know the full total without scanning everything, we Report:
+  // startIndex + items.length (+1 if hasMore, maybe? No, let's stick to what we have)
+  const logicalTotal = startIndex + mappedVideos.length;
 
   ctx.response.body = {
     items: mappedVideos,
-    total: total,
+    total: logicalTotal, // This makes the "Videos (X)" count grow as you load more
     page: page,
     limit: limit,
+    hasMore: hasMore
   };
 });
 
