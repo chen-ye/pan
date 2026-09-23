@@ -1,6 +1,6 @@
 FROM denoland/deno:2.5.6
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+COPY --from=mwader/static-ffmpeg:latest /ffprobe /usr/local/bin/
 
 WORKDIR /app
 

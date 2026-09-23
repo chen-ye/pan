@@ -64,6 +64,10 @@ The project includes specific testing infrastructure using Playwright and Vitest
 running in Docker.
 
 ```bash
-# Run all tests
-docker compose exec tests npm test
+# Run all tests on-demand
+docker compose run --rm test npm test
+
+# Or start the test container in the background
+docker compose --profile test up -d test
+docker compose exec test npm test
 ```
