@@ -20,13 +20,10 @@ export class VideoDetail extends SignalWatcher(LitElement) {
   state!: State;
   animReq: number | undefined;
 
-  // Internal state to track if we switched to seekable source
-  useSeekableSource = false;
   lastVideoPath: string | null = null;
 
   static override properties = {
     state: { attribute: false },
-    useSeekableSource: { state: true },
   };
 
   static override styles = [css`
@@ -273,12 +270,10 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       `;
     }
 
-    // Reset seekable source if path changed
+    // Clear thumbnails from previous video if path changed
     if (currentPath !== this.lastVideoPath) {
-        this.useSeekableSource = false;
         this.lastVideoPath = currentPath;
 
-        // Clear thumbnails from previous video
         const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery");
         if (gallery) gallery.innerHTML = "";
     }
@@ -294,7 +289,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const processingStatus = isProcessingCurrent ? job.status : null;
     const processingProgress = isProcessingCurrent ? job.progress : 0;
 
-    const videoSrc = this.useSeekableSource ? `/videos/${currentPath}` : `/videos-monolithic/${currentPath}`;
+    const videoSrc = `/videos/${currentPath}`;
 
     return html`
       <div class="video-container">
@@ -434,9 +429,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d")!;
 
-    // Use a separate, hidden video element for thumbnail generation
-    // This allows us to use the seekable /videos/ endpoint even if the main player
-    // is using the non-seekable /videos-monolithic/ endpoint.
+    // Use a separate, hidden video element for thumbnail generation so playback is uninterrupted
     const tempVideo = document.createElement("video");
     tempVideo.crossOrigin = "anonymous";
     tempVideo.src = `/videos/${this.state.currentVideoPath.get()}`;
@@ -570,29 +563,9 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       const item = document.createElement("div");
       item.className = "thumbnail-item";
       // When clicking a thumbnail, seek the MAIN video
-      item.onclick = async () => {
+      item.onclick = () => {
          const mainVideo = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
-
-         // If we haven't switched to seekable source yet, do it now
-         if (!this.useSeekableSource) {
-             this.useSeekableSource = true;
-             this.requestUpdate();
-
-             // Wait for update cycle and potential reload
-             await this.updateComplete;
-
-             // Wait for loadedmetadata before seeking
-             if (mainVideo && mainVideo.readyState < 1) { // HAVE_METADATA = 1
-                 mainVideo.addEventListener("loadedmetadata", () => {
-                     mainVideo.currentTime = det.timestamp;
-                     mainVideo.play();
-                 }, { once: true });
-             } else {
-                 mainVideo.currentTime = det.timestamp;
-                 mainVideo.play();
-             }
-         } else {
-             // Already seekable, just seek
+         if (mainVideo) {
              mainVideo.currentTime = det.timestamp;
              mainVideo.scrollIntoView({ behavior: "smooth", block: "center" });
              mainVideo.play();

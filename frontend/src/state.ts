@@ -283,7 +283,7 @@ export class State {
         const res = await fetch(`/api/results/${path}`);
         if (res.ok) {
           try {
-            let data = await res.json();
+            const data = await res.json();
             // data = this.normalizeLegacyFormat(data); // Backend handles this now
             this.resultsCache.set(path, data);
             this.currentResults.set(data);

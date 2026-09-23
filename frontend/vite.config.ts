@@ -74,20 +74,6 @@ export default defineConfig({
           );
         },
       },
-      "/videos-monolithic": {
-        target: "http://app:8000",
-        changeOrigin: true,
-        // deno-lint-ignore no-explicit-any
-        configure: (proxy: any) => {
-          // deno-lint-ignore no-explicit-any
-          (proxy as any).on(
-            "error",
-            (err: Error, _req: IncomingMessage, _res: ServerResponse) => {
-              console.log("proxy error", err);
-            },
-          );
-        },
-      },
     },
   },
 });
