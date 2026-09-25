@@ -7,6 +7,7 @@ import { sseService } from "./services/sse.ts";
 import { processingService } from "./services/processing.ts";
 import { getDirTree } from "./services/files.ts";
 import { normalizeLegacyFormat } from "./utils.ts";
+import { m3u8Service } from "./services/m3u8.ts";
 
 export const router = new Router();
 
@@ -278,6 +279,24 @@ router.all("/api/worker/(.*)", async (ctx) => {
   }
 });
 
+// 7.5 Get HLS M3U8 Playlist
+router.get("/api/videos/m3u8", async (ctx) => {
+  const videoPath = ctx.request.url.searchParams.get("path");
+  if (!videoPath || videoPath.includes("..")) {
+    ctx.throw(400, "Invalid path");
+    return;
+  }
+  const playlist = await m3u8Service.getOrGenerateSidecar(videoPath);
+  if (!playlist) {
+    ctx.throw(404, "HLS playlist not available for this video");
+    return;
+  }
+  ctx.response.status = 200;
+  ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
+  ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+  ctx.response.body = playlist;
+});
+
 // 8. Serve Videos
 router.get("/videos/:path*", async (ctx) => {
   const videoPath = ctx.params.path;
@@ -285,6 +304,22 @@ router.get("/videos/:path*", async (ctx) => {
     ctx.throw(400, "Invalid path");
     return;
   }
+
+  // Handle direct .m3u8 requests
+  if (videoPath.endsWith(".m3u8")) {
+    const relVideoPath = videoPath.slice(0, -5); // strip .m3u8
+    const playlist = await m3u8Service.getOrGenerateSidecar(relVideoPath);
+    if (!playlist) {
+      ctx.throw(404, "HLS playlist not available for this video");
+      return;
+    }
+    ctx.response.status = 200;
+    ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
+    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+    ctx.response.body = playlist;
+    return;
+  }
+
   try {
     // Do not use Oak.send, but directly stream the file. Oak.send seems to have issues with large files.
     const fullPath = join(CONFIG.DATA_DIR, videoPath);

@@ -1,5 +1,6 @@
 import { CONFIG } from "../config.ts";
 import { sseService } from "./sse.ts";
+import { m3u8Service } from "./m3u8.ts";
 
 interface ProcessingJob {
   path: string;
@@ -162,6 +163,10 @@ class ProcessingService {
       }
 
       sseService.broadcastEvent("video_processed", { path });
+      // Proactively pre-generate .m3u8 sidecar for instant playback
+      m3u8Service.getOrGenerateSidecar(path).catch((err) => {
+        console.warn(`Could not pre-generate m3u8 for ${path}:`, err);
+      });
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       sseService.broadcastEvent("processing_error", { path, error: errMsg });

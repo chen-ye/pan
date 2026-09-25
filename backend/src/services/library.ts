@@ -201,6 +201,9 @@ export class LibraryService {
     try {
       await Deno.remove(fullPath + ".json");
     } catch { /* JSON may not exist */ }
+    try {
+      await Deno.remove(fullPath + ".m3u8");
+    } catch { /* m3u8 may not exist */ }
 
     this.library = this.library.filter((v) => v.path !== relPath);
   }
@@ -226,6 +229,9 @@ export class LibraryService {
     try {
       await Deno.rename(fullSrcPath + ".json", fullDestPath + ".json");
     } catch { /* JSON may not exist */ }
+    try {
+      await Deno.rename(fullSrcPath + ".m3u8", fullDestPath + ".m3u8");
+    } catch { /* m3u8 may not exist */ }
 
     this.library = this.library.filter((v) => v.path !== relPath);
     return destRelPath;

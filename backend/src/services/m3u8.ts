@@ -1,0 +1,301 @@
+import { basename, join } from "@std/path";
+import { CONFIG } from "../config.ts";
+
+export interface FragmentInfo {
+  offset: number;
+  length: number;
+  decodeTime: number;
+}
+
+export interface ParseResult {
+  timescale: number;
+  initSize: number;
+  fragments: FragmentInfo[];
+}
+
+export class M3u8Service {
+  private inFlight = new Map<string, Promise<string | null>>();
+
+  /**
+   * Parses an fMP4 file to extract its initialization segment and fragment byte ranges.
+   * If the file is not a fragmented MP4 (no moof atoms), returns null.
+   */
+  async parseFmp4(filePath: string): Promise<ParseResult | null> {
+    let file: Deno.FsFile | null = null;
+    try {
+      file = await Deno.open(filePath, { read: true });
+      const fileInfo = await file.stat();
+      const fileSize = fileInfo.size;
+
+      let offset = 0;
+      let initSize = 0;
+      let timescale = 1000;
+      const fragments: FragmentInfo[] = [];
+
+      const headerBuf = new Uint8Array(16);
+
+      while (offset < fileSize) {
+        await file.seek(offset, Deno.SeekMode.Start);
+        const bytesRead = await file.read(headerBuf.subarray(0, 8));
+        if (!bytesRead || bytesRead < 8) break;
+
+        const view = new DataView(headerBuf.buffer);
+        let size = view.getUint32(0);
+        const tag = String.fromCharCode(
+          headerBuf[4],
+          headerBuf[5],
+          headerBuf[6],
+          headerBuf[7],
+        );
+
+        let headerLen = 8;
+        if (size === 1) {
+          // Extended 64-bit size
+          const extRead = await file.read(headerBuf.subarray(8, 16));
+          if (!extRead || extRead < 8) break;
+          // Number can accurately represent up to 2^53 - 1 (9 PB)
+          size = Number(view.getBigUint64(8));
+          headerLen = 16;
+        } else if (size === 0) {
+          // Box extends to EOF
+          size = fileSize - offset;
+        }
+
+        if (tag === "moov") {
+          initSize = offset + size;
+          // Read moov payload to extract timescale from mdhd
+          const payloadSize = size - headerLen;
+          if (payloadSize > 0 && payloadSize < 10 * 1024 * 1024) { // safety cap 10MB
+            const moovData = new Uint8Array(payloadSize);
+            await file.read(moovData);
+            const ts = this.extractTimescale(moovData);
+            if (ts) timescale = ts;
+          }
+        } else if (tag === "moof") {
+          const moofOffset = offset;
+          const moofSize = size;
+
+          // Read moof payload to extract decode_time from tfdt
+          let decodeTime = 0;
+          const payloadSize = moofSize - headerLen;
+          if (payloadSize > 0 && payloadSize < 1024 * 1024) { // safety cap 1MB
+            const moofData = new Uint8Array(payloadSize);
+            await file.read(moofData);
+            const dt = this.extractDecodeTime(moofData);
+            if (dt !== null) decodeTime = dt;
+          }
+
+          // Check if next box is mdat
+          const mdatOffset = offset + moofSize;
+          await file.seek(mdatOffset, Deno.SeekMode.Start);
+          const mdatHdr = new Uint8Array(16);
+          const mdatRead = await file.read(mdatHdr.subarray(0, 8));
+          if (mdatRead && mdatRead >= 8) {
+            const mdatView = new DataView(mdatHdr.buffer);
+            let mdatSize = mdatView.getUint32(0);
+            const mdatTag = String.fromCharCode(
+              mdatHdr[4],
+              mdatHdr[5],
+              mdatHdr[6],
+              mdatHdr[7],
+            );
+
+            if (mdatSize === 1) {
+              await file.read(mdatHdr.subarray(8, 16));
+              mdatSize = Number(mdatView.getBigUint64(8));
+            } else if (mdatSize === 0) {
+              mdatSize = fileSize - mdatOffset;
+            }
+
+            if (mdatTag === "mdat") {
+              const fragLength = moofSize + mdatSize;
+              fragments.push({
+                offset: moofOffset,
+                length: fragLength,
+                decodeTime,
+              });
+
+              // Advance offset past this entire fragment (moof + mdat)
+              offset += fragLength;
+              continue;
+            }
+          }
+        }
+
+        offset += size;
+      }
+
+      if (fragments.length === 0) {
+        return null;
+      }
+
+      return {
+        timescale,
+        initSize: initSize > 0 ? initSize : fragments[0].offset,
+        fragments,
+      };
+    } finally {
+      if (file) {
+        try {
+          file.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
+   * Helper to extract timescale from moov box bytes by searching for mdhd.
+   */
+  private extractTimescale(moovData: Uint8Array): number | null {
+    // Search for "mdhd" box
+    for (let i = 0; i <= moovData.length - 24; i++) {
+      if (
+        moovData[i] === 0x6d && // 'm'
+        moovData[i + 1] === 0x64 && // 'd'
+        moovData[i + 2] === 0x68 && // 'h'
+        moovData[i + 3] === 0x64 // 'd'
+      ) {
+        const ver = moovData[i + 4];
+        const view = new DataView(moovData.buffer, moovData.byteOffset + i);
+        if (ver === 1) {
+          // 4 (mdhd) + 1 (ver) + 3 (flags) + 8 (creation) + 8 (mod) = 24
+          return view.getUint32(24);
+        } else {
+          // 4 (mdhd) + 1 (ver) + 3 (flags) + 4 (creation) + 4 (mod) = 16
+          return view.getUint32(16);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Helper to extract decode time from moof box bytes by searching for tfdt.
+   */
+  private extractDecodeTime(moofData: Uint8Array): number | null {
+    // Search for "tfdt" box
+    for (let i = 0; i <= moofData.length - 16; i++) {
+      if (
+        moofData[i] === 0x74 && // 't'
+        moofData[i + 1] === 0x66 && // 'f'
+        moofData[i + 2] === 0x64 && // 'd'
+        moofData[i + 3] === 0x74 // 't'
+      ) {
+        const ver = moofData[i + 4];
+        const view = new DataView(moofData.buffer, moofData.byteOffset + i);
+        if (ver === 1) {
+          // 4 (tfdt) + 1 (ver) + 3 (flags) = 8
+          return Number(view.getBigUint64(8));
+        } else {
+          return view.getUint32(8);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Generates standard HLS Byte-Range playlist (RFC 8216) content.
+   */
+  buildM3u8Content(result: ParseResult, mediaUri: string): string {
+    const { timescale, initSize, fragments } = result;
+
+    let maxDuration = 1.0;
+    const segmentEntries: { duration: number; length: number; offset: number }[] = [];
+
+    for (let i = 0; i < fragments.length; i++) {
+      let duration = 1.0;
+      if (i + 1 < fragments.length) {
+        duration = (fragments[i + 1].decodeTime - fragments[i].decodeTime) / timescale;
+      } else if (segmentEntries.length > 0) {
+        duration = segmentEntries[segmentEntries.length - 1].duration;
+      }
+
+      if (duration <= 0 || isNaN(duration)) {
+        duration = 1.0;
+      }
+
+      if (duration > maxDuration) {
+        maxDuration = duration;
+      }
+
+      segmentEntries.push({
+        duration,
+        length: fragments[i].length,
+        offset: fragments[i].offset,
+      });
+    }
+
+    const lines: string[] = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      `#EXT-X-TARGETDURATION:${Math.ceil(maxDuration)}`,
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      `#EXT-X-MAP:URI="${mediaUri}",BYTERANGE="${initSize}@0"`,
+      "",
+    ];
+
+    for (const seg of segmentEntries) {
+      lines.push(`#EXTINF:${seg.duration.toFixed(3)},`);
+      lines.push(`#EXT-X-BYTERANGE:${seg.length}@${seg.offset}`);
+      lines.push(mediaUri);
+    }
+
+    lines.push("#EXT-X-ENDLIST");
+    return lines.join("\n") + "\n";
+  }
+
+  /**
+   * Retrieves an existing .m3u8 sidecar or generates and writes it to disk.
+   */
+  async getOrGenerateSidecar(relVideoPath: string): Promise<string | null> {
+    if (relVideoPath.includes("..")) return null;
+
+    const fullVideoPath = join(CONFIG.DATA_DIR, relVideoPath);
+    const sidecarPath = fullVideoPath + ".m3u8";
+
+    // 1. Try reading existing sidecar
+    try {
+      const content = await Deno.readTextFile(sidecarPath);
+      if (content.length > 0) return content;
+    } catch {
+      // Sidecar does not exist yet
+    }
+
+    // 2. Mutex deduplication to prevent thundering herd
+    const existingPromise = this.inFlight.get(relVideoPath);
+    if (existingPromise) {
+      return await existingPromise;
+    }
+
+    const generationPromise = (async () => {
+      try {
+        const parseResult = await this.parseFmp4(fullVideoPath);
+        if (!parseResult) return null;
+
+        const mediaUri = basename(relVideoPath);
+        const m3u8Content = this.buildM3u8Content(parseResult, mediaUri);
+
+        // Write sidecar atomically using temporary file
+        const tmpPath = `${sidecarPath}.tmp.${Date.now()}`;
+        await Deno.writeTextFile(tmpPath, m3u8Content);
+        await Deno.rename(tmpPath, sidecarPath);
+
+        return m3u8Content;
+      } catch (err) {
+        console.error(`Failed to generate m3u8 sidecar for ${relVideoPath}:`, err);
+        return null;
+      } finally {
+        this.inFlight.delete(relVideoPath);
+      }
+    })();
+
+    this.inFlight.set(relVideoPath, generationPromise);
+    return await generationPromise;
+  }
+}
+
+export const m3u8Service = new M3u8Service();

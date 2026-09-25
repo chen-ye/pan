@@ -83,4 +83,8 @@ volumes:
       vfs-cache-max-size: "${RCLONE_VFS_CACHE_MAX_SIZE:-50G}"
       vfs-cache-max-age: "${RCLONE_VFS_CACHE_MAX_AGE:-24h}"
       dir-cache-time: "${RCLONE_DIR_CACHE_TIME:-2h}"
+      timeout: "${RCLONE_TIMEOUT:-10s}"
+      contimeout: "${RCLONE_CONTIMEOUT:-5s}"
+      low-level-retries: "${RCLONE_LOW_LEVEL_RETRIES:-3}"
+      retries: "${RCLONE_RETRIES:-3}"
       allow_other: "true"

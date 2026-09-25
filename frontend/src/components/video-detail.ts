@@ -1,5 +1,6 @@
 import { css, html, LitElement } from "lit";
 import { SignalWatcher } from "@lit-labs/signals";
+import Hls from "hls.js";
 import { State } from "../state.ts";
 import type { Detection } from "../types.ts";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
@@ -21,6 +22,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
   animReq: number | undefined;
 
   lastVideoPath: string | null = null;
+  private hls: Hls | null = null;
 
   static override properties = {
     state: { attribute: false },
@@ -185,11 +187,6 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     this.animationLoop();
   }
 
-  override disconnectedCallback() {
-    super.disconnectedCallback();
-    if (this.animReq) cancelAnimationFrame(this.animReq);
-  }
-
   animationLoop() {
     this.drawOverlays();
     this.animReq = requestAnimationFrame(() => this.animationLoop());
@@ -254,6 +251,75 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     });
   }
 
+  override disconnectedCallback() {
+    super.disconnectedCallback();
+    if (this.hls) {
+      this.hls.destroy();
+      this.hls = null;
+    }
+    if (this.animReq) {
+      cancelAnimationFrame(this.animReq);
+      this.animReq = undefined;
+    }
+  }
+
+  private setupVideo(video: HTMLVideoElement, path: string) {
+    if (this.hls) {
+      this.hls.destroy();
+      this.hls = null;
+    }
+
+    const m3u8Url = `/videos/${path}.m3u8`;
+    const mp4Url = `/videos/${path}`;
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Native HLS support (Safari / iOS)
+      video.src = m3u8Url;
+    } else if (Hls.isSupported()) {
+      const hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        enableWorker: true,
+      });
+      hls.loadSource(m3u8Url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          console.warn("HLS fatal error, falling back to direct MP4 source", data);
+          hls.destroy();
+          this.hls = null;
+          video.src = mp4Url;
+        }
+      });
+      this.hls = hls;
+    } else {
+      video.src = mp4Url;
+    }
+  }
+
+  override updated() {
+    const currentPath = this.state?.currentVideoPath.get();
+    if (!currentPath) {
+      if (this.hls) {
+        this.hls.destroy();
+        this.hls = null;
+      }
+      this.lastVideoPath = null;
+      return;
+    }
+
+    if (currentPath !== this.lastVideoPath) {
+      this.lastVideoPath = currentPath;
+      const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery");
+      if (gallery) gallery.innerHTML = "";
+
+      const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
+      if (video) {
+        this.setupVideo(video, currentPath);
+      }
+    }
+  }
+
   override render() {
     if (!this.state) {
       return html`
@@ -270,14 +336,6 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       `;
     }
 
-    // Clear thumbnails from previous video if path changed
-    if (currentPath !== this.lastVideoPath) {
-        this.lastVideoPath = currentPath;
-
-        const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery");
-        if (gallery) gallery.innerHTML = "";
-    }
-
     const vidData = this.state.videos.get().find((v) => v.path === currentPath);
     const isProcessed = vidData && vidData.processed;
 
@@ -288,8 +346,6 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const isProcessingCurrent = job && job.path === currentPath;
     const processingStatus = isProcessingCurrent ? job.status : null;
     const processingProgress = isProcessingCurrent ? job.progress : 0;
-
-    const videoSrc = `/videos/${currentPath}`;
 
     return html`
       <div class="video-container">
@@ -302,7 +358,6 @@ export class VideoDetail extends SignalWatcher(LitElement) {
               loop
               preload="metadata"
               crossorigin="anonymous"
-              src=${videoSrc}
               @loadedmetadata="${this.onVideoLoad}"
             >
             </video>
@@ -432,10 +487,35 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     // Use a separate, hidden video element for thumbnail generation so playback is uninterrupted
     const tempVideo = document.createElement("video");
     tempVideo.crossOrigin = "anonymous";
-    tempVideo.src = `/videos/${this.state.currentVideoPath.get()}`;
     tempVideo.muted = true;
     tempVideo.playsInline = true;
     tempVideo.preload = "auto";
+
+    let tempHls: Hls | null = null;
+    const currentVideo = this.state.currentVideoPath.get();
+    const m3u8Url = `/videos/${currentVideo}.m3u8`;
+    const mp4Url = `/videos/${currentVideo}`;
+
+    if (tempVideo.canPlayType("application/vnd.apple.mpegurl")) {
+      tempVideo.src = m3u8Url;
+    } else if (Hls.isSupported()) {
+      tempHls = new Hls({
+        maxBufferLength: 10,
+        enableWorker: true,
+      });
+      tempHls.loadSource(m3u8Url);
+      tempHls.attachMedia(tempVideo);
+      tempHls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          console.warn("HLS error in thumbnail generator, falling back to direct MP4", data);
+          tempHls?.destroy();
+          tempHls = null;
+          tempVideo.src = mp4Url;
+        }
+      });
+    } else {
+      tempVideo.src = mp4Url;
+    }
 
     // Attach to DOM but hide it to ensure browser prioritizes loading
     tempVideo.style.position = "absolute";
@@ -446,9 +526,13 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
     // Helper to cleanup
     const cleanup = () => {
-        tempVideo.pause();
-        tempVideo.src = "";
-        tempVideo.remove();
+      if (tempHls) {
+        tempHls.destroy();
+        tempHls = null;
+      }
+      tempVideo.pause();
+      tempVideo.src = "";
+      tempVideo.remove();
     };
 
     const errors: string[] = [];
