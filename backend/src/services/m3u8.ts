@@ -5,6 +5,7 @@ export interface FragmentInfo {
   offset: number;
   length: number;
   decodeTime: number;
+  duration?: number;
 }
 
 export interface ParseResult {
@@ -75,14 +76,19 @@ export class M3u8Service {
           const moofOffset = offset;
           const moofSize = size;
 
-          // Read moof payload to extract decode_time from tfdt
+          // Read moof payload to extract decode_time from tfdt and sample duration from trun
           let decodeTime = 0;
+          let duration: number | undefined;
           const payloadSize = moofSize - headerLen;
           if (payloadSize > 0 && payloadSize < 1024 * 1024) { // safety cap 1MB
             const moofData = new Uint8Array(payloadSize);
             await file.read(moofData);
             const dt = this.extractDecodeTime(moofData);
             if (dt !== null) decodeTime = dt;
+            const trunDur = this.extractTrunDuration(moofData);
+            if (trunDur !== null && trunDur > 0 && timescale > 0) {
+              duration = trunDur / timescale;
+            }
           }
 
           // Check if next box is mdat
@@ -113,6 +119,7 @@ export class M3u8Service {
                 offset: moofOffset,
                 length: fragLength,
                 decodeTime,
+                duration,
               });
 
               // Advance offset past this entire fragment (moof + mdat)
@@ -197,6 +204,46 @@ export class M3u8Service {
   }
 
   /**
+   * Helper to extract total duration of a fragment from its trun box.
+   */
+  private extractTrunDuration(moofData: Uint8Array): number | null {
+    for (let i = 0; i <= moofData.length - 16; i++) {
+      if (
+        moofData[i] === 0x74 && // 't'
+        moofData[i + 1] === 0x72 && // 'r'
+        moofData[i + 2] === 0x75 && // 'u'
+        moofData[i + 3] === 0x6e // 'n'
+      ) {
+        const view = new DataView(moofData.buffer, moofData.byteOffset + i);
+        const flags = (moofData[i + 5] << 16) | (moofData[i + 6] << 8) | moofData[i + 7];
+        const sampleCount = view.getUint32(8);
+
+        let p = 12;
+        if (flags & 0x000001) p += 4; // data-offset
+        if (flags & 0x000004) p += 4; // first-sample-flags
+
+        let durSum = 0;
+        const hasDur = !!(flags & 0x000100);
+        const hasSize = !!(flags & 0x000200);
+        const hasFlags = !!(flags & 0x000400);
+        const hasCtts = !!(flags & 0x000800);
+
+        const sampleSize = (hasDur ? 4 : 0) + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCtts ? 4 : 0);
+
+        if (hasDur) {
+          for (let s = 0; s < sampleCount && p + 4 <= moofData.length; s++) {
+            durSum += view.getUint32(p);
+            p += sampleSize;
+          }
+          return durSum;
+        }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Generates standard HLS Byte-Range playlist (RFC 8216) content.
    */
   buildM3u8Content(result: ParseResult, mediaUri: string): string {
@@ -207,7 +254,9 @@ export class M3u8Service {
 
     for (let i = 0; i < fragments.length; i++) {
       let duration = 1.0;
-      if (i + 1 < fragments.length) {
+      if (fragments[i].duration && fragments[i].duration! > 0) {
+        duration = fragments[i].duration!;
+      } else if (i + 1 < fragments.length && fragments[i + 1].decodeTime > fragments[i].decodeTime) {
         duration = (fragments[i + 1].decodeTime - fragments[i].decodeTime) / timescale;
       } else if (segmentEntries.length > 0) {
         duration = segmentEntries[segmentEntries.length - 1].duration;
