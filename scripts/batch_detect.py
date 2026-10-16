@@ -44,10 +44,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torchvision.transforms.functional as TF
-from megadetector.detection import run_detector
 from torchcodec.decoders import VideoDecoder
 from tqdm import tqdm
+
+sys.path.append(str(Path(__file__).resolve().parent.parent / "worker"))
+from detector import TorchVisionMegaDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -275,23 +276,12 @@ def process_video_with_torchcodec(
         chunk_indices = indices[i : i + batch_size]
         frame_batch = decoder.get_frames_at(chunk_indices)
 
-        raw_frames = frame_batch.data  # shape: (B, H, W, 3), uint8 RGB
-        b, h, w, _ = raw_frames.shape
-
-        max_dim = max(h, w)
-        if max_dim > target_size:
-            scale = target_size / max_dim
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            # Permute to (B, C, H, W) for PyTorch tensor resizing, then back to (B, H, W, C)
-            tensor_chw = raw_frames.permute(0, 3, 1, 2)
-            resized_tensor = TF.resize(tensor_chw, [new_h, new_w], antialias=True)
-            batch_np = resized_tensor.permute(0, 2, 3, 1).cpu().numpy()
-        else:
-            batch_np = raw_frames.cpu().numpy()
-
-        images_list = [batch_np[idx] for idx in range(b)]
-        batch_results = model.generate_detections_one_batch(images_list, chunk_indices[:b])
+        raw_frames = frame_batch.data  # shape: (B, H, W, 3), uint8 RGB tensor
+        batch_results = model.generate_detections_one_batch(
+            raw_frames,
+            image_ids=chunk_indices,
+            detection_threshold=conf_threshold,
+        )
         detections = extract_detections_from_model_batch(batch_results, fps, conf_threshold)
         results_list.extend(detections)
 
@@ -494,31 +484,37 @@ def main() -> None:
         logger.info("All videos are already processed. Nothing to do.")
         sys.exit(0)
 
-    force_cpu = False
+    target_device: torch.device
     if args.device:
         if args.device.lower() == "cpu":
-            force_cpu = True
+            target_device = torch.device("cpu")
             logger.info("Using CPU as requested.")
         elif args.device.lower().startswith("cuda"):
             if not torch.cuda.is_available():
                 logger.error("CUDA requested but not available.")
                 sys.exit(1)
-            if ":" in args.device:
-                cuda_idx = int(args.device.split(":")[1])
-                torch.cuda.set_device(cuda_idx)
+            target_device = torch.device(args.device)
             logger.info("Using GPU: %s (%s)", torch.cuda.get_device_name(0), args.device)
+        else:
+            target_device = torch.device(args.device)
     elif torch.cuda.is_available():
+        target_device = torch.device("cuda:0")
         logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
     else:
-        force_cpu = True
+        target_device = torch.device("cpu")
         logger.info("CUDA not available. Using CPU.")
 
     logger.info("Decoder backend: torchcodec (strictly enforced)")
+    logger.info("Inference engine: TorchVisionMegaDetector (pure GPU tensor pipeline)")
 
     logger.info("Loading MegaDetector model '%s'...", args.model)
     start_load = time.time()
     try:
-        model = run_detector.load_detector(args.model, force_cpu=force_cpu)
+        model = TorchVisionMegaDetector(
+            model_version=args.model,
+            device=target_device,
+            default_image_size=args.target_size,
+        )
         logger.info("Model loaded successfully in %.2fs.", time.time() - start_load)
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to load MegaDetector model: %s", e)
