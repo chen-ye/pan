@@ -140,3 +140,18 @@ vite.config.ts.timestamp-*
 
 # Certificates
 certs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# HAR captures
+*.har
+
+# Playwright reports and test results
+playwright-report/
+test-results/
+

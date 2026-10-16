@@ -272,10 +272,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const m3u8Url = `/videos/${path}.m3u8`;
     const mp4Url = `/videos/${path}`;
 
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      // Native HLS support (Safari / iOS)
-      video.src = m3u8Url;
-    } else if (Hls.isSupported()) {
+    if (Hls.isSupported()) {
       const hls = new Hls({
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
@@ -283,15 +280,25 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       });
       hls.loadSource(m3u8Url);
       hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch(() => {});
+      });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
-          console.warn("HLS fatal error, falling back to direct MP4 source", data);
+          console.warn(
+            "HLS fatal error, falling back to direct MP4 source:",
+            data.details,
+            "Error:", data.error?.message || data.error,
+          );
           hls.destroy();
           this.hls = null;
           video.src = mp4Url;
         }
       });
       this.hls = hls;
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Native HLS support (Safari on iOS where MSE is not supported)
+      video.src = m3u8Url;
     } else {
       video.src = mp4Url;
     }
@@ -496,9 +503,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const m3u8Url = `/videos/${currentVideo}.m3u8`;
     const mp4Url = `/videos/${currentVideo}`;
 
-    if (tempVideo.canPlayType("application/vnd.apple.mpegurl")) {
-      tempVideo.src = m3u8Url;
-    } else if (Hls.isSupported()) {
+    if (Hls.isSupported()) {
       tempHls = new Hls({
         maxBufferLength: 10,
         enableWorker: true,
@@ -513,6 +518,8 @@ export class VideoDetail extends SignalWatcher(LitElement) {
           tempVideo.src = mp4Url;
         }
       });
+    } else if (tempVideo.canPlayType("application/vnd.apple.mpegurl")) {
+      tempVideo.src = m3u8Url;
     } else {
       tempVideo.src = mp4Url;
     }

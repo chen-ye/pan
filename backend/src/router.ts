@@ -286,15 +286,27 @@ router.get("/api/videos/m3u8", async (ctx) => {
     ctx.throw(400, "Invalid path");
     return;
   }
-  const playlist = await m3u8Service.getOrGenerateSidecar(videoPath);
-  if (!playlist) {
-    ctx.throw(404, "HLS playlist not available for this video");
-    return;
+  try {
+    const playlist = await m3u8Service.getOrGenerateSidecar(videoPath);
+    if (!playlist) {
+      ctx.throw(404, "HLS playlist not available for this video (not a fragmented MP4)");
+      return;
+    }
+    ctx.response.status = 200;
+    ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
+    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+    ctx.response.body = playlist;
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) {
+      ctx.throw(404, `Video not found: ${videoPath}`);
+    } else if (err instanceof Deno.errors.PermissionDenied) {
+      ctx.throw(403, `Permission denied accessing video: ${videoPath}`);
+    } else if (err && typeof err === "object" && "status" in err) {
+      throw err;
+    } else {
+      ctx.throw(500, `Error generating HLS playlist: ${(err as Error).message}`);
+    }
   }
-  ctx.response.status = 200;
-  ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
-  ctx.response.headers.set("Access-Control-Allow-Origin", "*");
-  ctx.response.body = playlist;
 });
 
 // 8. Serve Videos
@@ -308,16 +320,28 @@ router.get("/videos/:path*", async (ctx) => {
   // Handle direct .m3u8 requests
   if (videoPath.endsWith(".m3u8")) {
     const relVideoPath = videoPath.slice(0, -5); // strip .m3u8
-    const playlist = await m3u8Service.getOrGenerateSidecar(relVideoPath);
-    if (!playlist) {
-      ctx.throw(404, "HLS playlist not available for this video");
+    try {
+      const playlist = await m3u8Service.getOrGenerateSidecar(relVideoPath);
+      if (!playlist) {
+        ctx.throw(404, "HLS playlist not available for this video (not a fragmented MP4)");
+        return;
+      }
+      ctx.response.status = 200;
+      ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
+      ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+      ctx.response.body = playlist;
       return;
+    } catch (err) {
+      if (err instanceof Deno.errors.NotFound) {
+        ctx.throw(404, `Video not found: ${relVideoPath}`);
+      } else if (err instanceof Deno.errors.PermissionDenied) {
+        ctx.throw(403, `Permission denied accessing video: ${relVideoPath}`);
+      } else if (err && typeof err === "object" && "status" in err) {
+        throw err;
+      } else {
+        ctx.throw(500, `Error generating HLS playlist: ${(err as Error).message}`);
+      }
     }
-    ctx.response.status = 200;
-    ctx.response.headers.set("Content-Type", "application/vnd.apple.mpegurl");
-    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
-    ctx.response.body = playlist;
-    return;
   }
 
   try {
