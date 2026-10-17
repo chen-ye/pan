@@ -291,6 +291,7 @@ def process_video_with_dali(
         rel_path = video_path.name
 
     fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
+    is_partial = decoder.is_partial or (0 < decoder.samples_read < decoder.total_samples)
     result_data = {
         "video": rel_path,
         "metadata": {
@@ -298,9 +299,14 @@ def process_video_with_dali(
             "total_frames": last_frame_num + 1,
             "width": width,
             "height": height,
+            "partial": is_partial,
         },
+        "partial": is_partial,
         "detections": results_list,
     }
+    if is_partial and decoder.partial_reason:
+        result_data["metadata"]["partial_reason"] = decoder.partial_reason
+        result_data["partial_reason"] = decoder.partial_reason
 
     return result_data, len(results_list)
 
@@ -526,6 +532,7 @@ def main() -> None:
     processed_count = 0
     blank_count = 0
     detected_count = 0
+    partial_count = 0
     total_detections = 0
     error_count = 0
     start_time = time.time()
@@ -550,6 +557,8 @@ def main() -> None:
                 save_detection_json(video_path, data)
                 processed_count += 1
                 total_detections += det_count
+                if data.get("partial"):
+                    partial_count += 1
 
                 if det_count == 0:
                     blank_count += 1
@@ -578,6 +587,8 @@ def main() -> None:
     logger.info("Total scanned:      %d", len(discovered_items))
     logger.info("Already processed:  %d (skipped)", skipped_count)
     logger.info("Newly processed:    %d", processed_count)
+    logger.info("  - Fully decoded:  %d", processed_count - partial_count)
+    logger.info("  - Partial (corrupt EOF): %d", partial_count)
     logger.info("  - Blank (0 det):  %d", blank_count)
     logger.info("  - Detections:     %d (%d total objects)", detected_count, total_detections)
     if error_count > 0:

@@ -61,6 +61,8 @@ class DaliVideoDecoder:
         self.total_samples = next(iter(epoch_dict.values())) if epoch_dict else 0
         self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size if self.total_samples > 0 else 0
         self._samples_read = 0
+        self.is_partial = False
+        self.partial_reason: str | None = None
 
     @property
     def samples_read(self) -> int:
@@ -73,7 +75,22 @@ class DaliVideoDecoder:
         if self._samples_read >= self.total_samples:
             raise StopIteration
 
-        out = self.pipe.run()
+        try:
+            out = self.pipe.run()
+        except RuntimeError as e:
+            err_str = str(e)
+            if ("av_bsf_receive_packet" in err_str or "Critical error in pipeline" in err_str) and self._samples_read > 0:
+                self.is_partial = True
+                self.partial_reason = "corrupt_trailing_packet"
+                logger.warning(
+                    "Corrupt EOF/trailing packet encountered on %s after %d/%d frames; stopping gracefully (partial=True).",
+                    self.video_path,
+                    self._samples_read,
+                    self.total_samples,
+                )
+                raise StopIteration from None
+            raise
+
         raw_frames = torch.from_dlpack(out[0].as_tensor()).squeeze(1)  # shape: (B, H, W, 3) uint8 in VRAM
         raw_fnums = torch.from_dlpack(out[1].as_tensor()).squeeze(-1)
         raw_ts = torch.from_dlpack(out[2].as_tensor()).squeeze(-1)
@@ -467,6 +484,7 @@ class VideoProcessor:
 
         fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
         json_path = Path(f"{target_file}.json")
+        is_partial = decoder.is_partial or (0 < decoder.samples_read < total_sample_frames)
         output_data = {
             "video": relative_video_name,
             "metadata": {
@@ -474,17 +492,23 @@ class VideoProcessor:
                 "total_frames": last_frame_num + 1,
                 "width": width,
                 "height": height,
+                "partial": is_partial,
             },
+            "partial": is_partial,
             "detections": results_list,
         }
+        if is_partial and decoder.partial_reason:
+            output_data["metadata"]["partial_reason"] = decoder.partial_reason
+            output_data["partial_reason"] = decoder.partial_reason
 
         try:
             save_atomic_json(json_path, output_data)
-            logger.info("Saved results to %s (%d detections).", json_path, len(results_list))
+            logger.info("Saved results to %s (%d detections, partial=%s).", json_path, len(results_list), is_partial)
             yield {
                 "status": "complete",
                 "output": str(json_path),
                 "detections_count": len(results_list),
+                "partial": is_partial,
                 "detections": results_list,
             }
         except Exception as err:  # noqa: BLE001
