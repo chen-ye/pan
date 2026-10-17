@@ -13,13 +13,13 @@
 #     "torchvision>=0.15.0",
 #     "tqdm>=4.66.0",
 #     "ultralytics>=8.0.0",
+#     "nvidia-dali-cuda120>=2.0.0",
 # ]
 # ///
 """Batch MegaDetector video processing CLI for Pan NVR.
 
-Processes video files using torchcodec for frame extraction and MegaDetector
-for object detection, matching Pan UI's exact metadata and detection format.
-Strictly requires torchcodec without fallback.
+Processes video files using NVIDIA DALI NVDEC for hardware frame decoding and
+TorchVision MegaDetector for GPU inference, matching Pan UI's exact metadata format.
 """
 
 import os
@@ -44,11 +44,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torchcodec.decoders import VideoDecoder
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "worker"))
-from detector import TorchVisionMegaDetector
+from detector import DaliVideoDecoder, TorchVisionMegaDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,13 +209,14 @@ def move_file_and_sidecars(
 
 def extract_detections_from_model_batch(
     batch_results: list[dict[str, Any]],
-    fps: float,
     conf_threshold: float,
+    timestamps: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """Parse raw MegaDetector batch detections into Pan's schema."""
     extracted: list[dict[str, Any]] = []
-    for res in batch_results:
+    for i_res, res in enumerate(batch_results):
         frame_num = int(res["file"])
+        ts = timestamps[i_res] if timestamps and i_res < len(timestamps) else 0.0
         if res.get("detections"):
             for d in res["detections"]:
                 conf = float(d["conf"])
@@ -225,10 +225,9 @@ def extract_detections_from_model_batch(
                     class_name = CLASS_MAPPING.get(cat_id, f"unknown_{cat_id}")
                     x, y, w, h = d["bbox"]
                     bbox = [float(x), float(y), float(x + w), float(y + h)]
-                    timestamp = float(frame_num / fps) if fps > 0 else 0.0
                     extracted.append({
                         "frame": frame_num,
-                        "timestamp": round(timestamp, 3),
+                        "timestamp": round(ts, 3),
                         "category": class_name,
                         "conf": round(conf, 4),
                         "bbox": [round(coord, 5) for coord in bbox],
@@ -236,9 +235,9 @@ def extract_detections_from_model_batch(
     return extracted
 
 
-def process_video_with_torchcodec(
+def process_video_with_dali(
     video_path: Path,
-    model: Any,
+    model: TorchVisionMegaDetector,
     base_dir: Path | None,
     batch_size: int = 32,
     conf_threshold: float = 0.2,
@@ -246,58 +245,57 @@ def process_video_with_torchcodec(
     frame_fps: float = 4.0,
     pbar_frames: tqdm | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Process video using torchcodec as the sole decoder and MegaDetector for inference."""
-    # Use approximate seek mode to prevent full video packet index scans over SMB
-    decoder = VideoDecoder(str(video_path), seek_mode="approximate", dimension_order="NHWC")
+    """Process video using NVIDIA DALI NVDEC as the sole decoder and GPU MegaDetector for inference."""
+    step = max(int(12.0 / frame_fps), 1)
+    decoder = DaliVideoDecoder(video_path, step=step, batch_size=batch_size, device_id=0)
 
-    meta = decoder.metadata
-    fps = float(meta.average_fps or 0.0)
-    total_frames = int(meta.num_frames or 0)
-    width = int(meta.width or 0)
-    height = int(meta.height or 0)
-
-    if fps <= 0.0:
-        raise ValueError(f"Unable to read valid fps from video metadata: {video_path}")
-
-    frame_interval = max(int(fps / frame_fps), 1)
-
-    if total_frames <= 0:
-        raise ValueError(f"Unable to read frame count from video metadata: {video_path}")
-
-    indices = list(range(0, total_frames, frame_interval))
+    if decoder.total_samples == 0:
+        raise ValueError(f"Unable to read video frames with DALI: {video_path}")
 
     if pbar_frames is not None:
-        pbar_frames.reset(total=len(indices))
-        pbar_frames.set_description(f"Frames [torchcodec]: {video_path.name[:25]}")
+        pbar_frames.reset(total=decoder.total_samples)
+        pbar_frames.set_description(f"Frames [DALI NVDEC]: {video_path.name[:25]}")
 
     results_list: list[dict[str, Any]] = []
+    width = 0
+    height = 0
+    last_frame_num = 0
+    last_timestamp = 0.0
 
-    for i in range(0, len(indices), batch_size):
-        chunk_indices = indices[i : i + batch_size]
-        frame_batch = decoder.get_frames_at(chunk_indices)
+    for frames, fnums, timestamps in decoder:
+        if width == 0:
+            height = frames.shape[1]
+            width = frames.shape[2]
 
-        raw_frames = frame_batch.data  # shape: (B, H, W, 3), uint8 RGB tensor
         batch_results = model.generate_detections_one_batch(
-            raw_frames,
-            image_ids=chunk_indices,
+            frames,
+            image_ids=fnums,
             detection_threshold=conf_threshold,
         )
-        detections = extract_detections_from_model_batch(batch_results, fps, conf_threshold)
+        detections = extract_detections_from_model_batch(
+            batch_results,
+            conf_threshold=conf_threshold,
+            timestamps=timestamps,
+        )
         results_list.extend(detections)
 
+        last_frame_num = fnums[-1]
+        last_timestamp = timestamps[-1]
+
         if pbar_frames is not None:
-            pbar_frames.update(len(chunk_indices))
+            pbar_frames.update(len(fnums))
 
     if base_dir and base_dir in video_path.parents:
         rel_path = str(video_path.relative_to(base_dir))
     else:
         rel_path = video_path.name
 
+    fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
     result_data = {
         "video": rel_path,
         "metadata": {
-            "fps": round(fps, 2),
-            "total_frames": total_frames,
+            "fps": fps,
+            "total_frames": last_frame_num + 1,
             "width": width,
             "height": height,
         },
@@ -323,7 +321,7 @@ def save_detection_json(video_path: Path, data: dict[str, Any]) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch MegaDetector video processor matching Pan NVR format (using torchcodec).",
+        description="Batch MegaDetector video processor matching Pan NVR format (using NVIDIA DALI NVDEC).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -504,7 +502,7 @@ def main() -> None:
         target_device = torch.device("cpu")
         logger.info("CUDA not available. Using CPU.")
 
-    logger.info("Decoder backend: torchcodec (strictly enforced)")
+    logger.info("Decoder backend: NVIDIA DALI (hardware NVDEC)")
     logger.info("Inference engine: TorchVisionMegaDetector (pure GPU tensor pipeline)")
 
     logger.info("Loading MegaDetector model '%s'...", args.model)
@@ -539,7 +537,7 @@ def main() -> None:
         for video_path in pbar_videos:
             pbar_videos.set_postfix_str(video_path.name[:25])
             try:
-                data, det_count = process_video_with_torchcodec(
+                data, det_count = process_video_with_dali(
                     video_path=video_path,
                     model=model,
                     base_dir=base_dir,
@@ -566,7 +564,7 @@ def main() -> None:
 
             except Exception as e:  # noqa: BLE001
                 error_count += 1
-                logger.error("Error processing %s via torchcodec: %s", video_path, e)
+                logger.error("Error processing %s via DALI: %s", video_path, e)
 
     except KeyboardInterrupt:
         logger.warning("\nProcessing interrupted by user (Ctrl+C). Exiting...")

@@ -7,7 +7,6 @@ dependencies = [
     "flask",
     "torch",
     "torchvision",
-    "opencv-python",
     "ultralytics",
     "requests",
     "psutil",
@@ -16,4 +15,6 @@ dependencies = [
     "megadetector",
     "tqdm",
     "torchcodec",
+    "nvidia-dali-cuda120>=2.0.0",
 ]
+

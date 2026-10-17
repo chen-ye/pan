@@ -1,4 +1,4 @@
-"""Deep module for video detection using torchcodec and torchvision-accelerated MegaDetector."""
+"""Deep module for video detection using NVIDIA DALI hardware decoding and TorchVision MegaDetector."""
 
 import json
 import logging
@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from megadetector.detection import run_detector
-from torchcodec.decoders import VideoDecoder
+from nvidia.dali import fn, pipeline_def
 from torchvision import ops
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,68 @@ CLASS_MAPPING: dict[Any, str] = {
     "2": "person",
     "3": "vehicle",
 }
+
+
+class DaliVideoDecoder:
+    """Hardware-accelerated video decoder using NVIDIA DALI and NVDEC."""
+
+    def __init__(
+        self,
+        video_path: str | Path,
+        step: int = 6,
+        batch_size: int = 32,
+        device_id: int = 0,
+    ) -> None:
+        self.video_path = str(Path(video_path).resolve())
+        self.step = max(int(step), 1)
+        self.batch_size = batch_size
+        self.device_id = device_id
+
+        # Define DALI graph using modern experimental video reader with NVDEC
+        @pipeline_def(batch_size=self.batch_size, num_threads=4, device_id=self.device_id)
+        def video_pipe():
+            outputs = fn.experimental.readers.video(
+                filenames=[self.video_path],
+                sequence_length=1,
+                step=self.step,
+                enable_frame_num="scalar",
+                enable_timestamps=True,
+                device="gpu",
+            )
+            return outputs[0], outputs[1], outputs[2]
+
+        self.pipe = video_pipe()
+        self.pipe.build()
+
+        epoch_dict = self.pipe.epoch_size()
+        self.total_samples = next(iter(epoch_dict.values())) if epoch_dict else 0
+        self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size if self.total_samples > 0 else 0
+        self._samples_read = 0
+
+    @property
+    def samples_read(self) -> int:
+        return self._samples_read
+
+    def __iter__(self) -> "DaliVideoDecoder":
+        return self
+
+    def __next__(self) -> tuple[torch.Tensor, list[int], list[float]]:
+        if self._samples_read >= self.total_samples:
+            raise StopIteration
+
+        out = self.pipe.run()
+        raw_frames = torch.from_dlpack(out[0].as_tensor()).squeeze(1)  # shape: (B, H, W, 3) uint8 in VRAM
+        raw_fnums = torch.from_dlpack(out[1].as_tensor()).squeeze(-1)
+        raw_ts = torch.from_dlpack(out[2].as_tensor()).squeeze(-1)
+
+        valid_count = min(self.batch_size, self.total_samples - self._samples_read)
+        self._samples_read += valid_count
+
+        frames = raw_frames[:valid_count]
+        fnums = [int(n.item()) for n in raw_fnums[:valid_count]]
+        timestamps = [round(float(t.item()), 3) for t in raw_ts[:valid_count]]
+
+        return frames, fnums, timestamps
 
 
 class TorchVisionMegaDetector:
@@ -275,13 +337,14 @@ class TorchVisionMegaDetector:
 
 def extract_detections_from_batch(
     batch_results: list[dict[str, Any]],
-    fps: float,
     conf_threshold: float,
+    timestamps: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """Parse raw MegaDetector batch detections into Pan schema."""
     extracted: list[dict[str, Any]] = []
-    for res in batch_results:
+    for i_res, res in enumerate(batch_results):
         frame_num = int(res["file"])
+        ts = timestamps[i_res] if timestamps and i_res < len(timestamps) else 0.0
         if res.get("detections"):
             for d in res["detections"]:
                 conf = float(d["conf"])
@@ -290,10 +353,9 @@ def extract_detections_from_batch(
                     class_name = CLASS_MAPPING.get(cat_id, f"unknown_{cat_id}")
                     x, y, w, h = d["bbox"]
                     bbox = [float(x), float(y), float(x + w), float(y + h)]
-                    timestamp = float(frame_num / fps) if fps > 0 else 0.0
                     extracted.append({
                         "frame": frame_num,
-                        "timestamp": round(timestamp, 3),
+                        "timestamp": round(ts, 3),
                         "category": class_name,
                         "conf": round(conf, 4),
                         "bbox": [round(coord, 5) for coord in bbox],
@@ -314,7 +376,7 @@ def save_atomic_json(json_path: Path, data: dict[str, Any]) -> None:
 
 
 class VideoProcessor:
-    """Encapsulates torchcodec frame decoding and Torchvision MegaDetector inference."""
+    """Encapsulates NVIDIA DALI NVDEC frame decoding and Torchvision MegaDetector inference."""
 
     def __init__(
         self,
@@ -322,7 +384,8 @@ class VideoProcessor:
         device: str | None = None,
     ) -> None:
         self.model_version = model_version
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device_id = 0 if self.device.startswith("cuda") else -1
         self.detector = TorchVisionMegaDetector(
             model_version=self.model_version,
             device=self.device,
@@ -345,69 +408,70 @@ class VideoProcessor:
             yield {"error": f"File not found: {video_path}"}
             return
 
-        logger.info("Starting processing for %s...", target_file)
+        logger.info("Starting DALI NVDEC processing for %s...", target_file)
         yield {"status": "starting", "path": str(target_file)}
 
+        # Approximate nominal step for frame_fps (assume ~12-24 fps nominal; step=3 gives 4 fps from 12fps)
+        step = max(int(12.0 / frame_fps), 1)
+
         try:
-            decoder = VideoDecoder(str(target_file), seek_mode="approximate", dimension_order="NHWC")
+            decoder = DaliVideoDecoder(
+                target_file,
+                step=step,
+                batch_size=batch_size,
+                device_id=max(self.device_id, 0),
+            )
         except Exception as err:  # noqa: BLE001
-            logger.error("Failed to open video decoder for %s: %s", target_file, err)
-            yield {"error": f"Failed to open video decoder: {err}"}
+            logger.error("Failed to open DALI video decoder for %s: %s", target_file, err)
+            yield {"error": f"Failed to open DALI video decoder: {err}"}
             return
 
-        meta = decoder.metadata
-        fps = float(meta.average_fps or 0.0)
-        total_frames = int(meta.num_frames or 0)
-        width = int(meta.width or 0)
-        height = int(meta.height or 0)
-
-        if fps <= 0.0:
-            yield {"error": f"Invalid video fps: {fps}"}
+        total_sample_frames = decoder.total_samples
+        if total_sample_frames == 0:
+            yield {"error": f"Video contains 0 decodeable samples: {target_file}"}
             return
-
-        frame_interval = max(int(fps / frame_fps), 1)
-        if total_frames <= 0:
-            total_frames = 1000
-
-        indices = list(range(0, total_frames, frame_interval))
-        total_sample_frames = len(indices)
 
         results_list: list[dict[str, Any]] = []
-        processed_count = 0
+        width = 0
+        height = 0
+        last_frame_num = 0
+        last_timestamp = 0.0
 
-        for i in range(0, total_sample_frames, batch_size):
-            chunk_indices = indices[i : i + batch_size]
-            try:
-                frame_batch = decoder.get_frames_at(chunk_indices)
-            except Exception as err:  # noqa: BLE001
-                logger.error("Failed decoding frames at indices %s: %s", chunk_indices[:3], err)
-                continue
+        for frames, fnums, timestamps in decoder:
+            if width == 0:
+                height = frames.shape[1]
+                width = frames.shape[2]
 
-            # Pure GPU pipeline: feed decoded tensor directly to TorchVisionMegaDetector
-            raw_frames = frame_batch.data  # shape: (B, H, W, 3), uint8 RGB tensor
             batch_results = self.detector.generate_detections_one_batch(
-                raw_frames,
-                image_ids=chunk_indices,
+                frames,
+                image_ids=fnums,
                 detection_threshold=conf_threshold,
             )
-            detections = extract_detections_from_batch(batch_results, fps, conf_threshold)
+            detections = extract_detections_from_batch(
+                batch_results,
+                conf_threshold=conf_threshold,
+                timestamps=timestamps,
+            )
             results_list.extend(detections)
 
-            processed_count += len(chunk_indices)
-            progress = min(processed_count / max(total_sample_frames, 1), 1.0)
+            last_frame_num = fnums[-1]
+            last_timestamp = timestamps[-1]
+
+            progress = min(decoder.samples_read / max(total_sample_frames, 1), 1.0)
             yield {
                 "status": "progress",
                 "progress": round(progress, 3),
-                "frame": chunk_indices[-1],
-                "total_frames": total_frames,
+                "frame": last_frame_num,
+                "total_frames": total_sample_frames * step,
             }
 
+        fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
         json_path = Path(f"{target_file}.json")
         output_data = {
             "video": relative_video_name,
             "metadata": {
-                "fps": round(fps, 2),
-                "total_frames": total_frames,
+                "fps": fps,
+                "total_frames": last_frame_num + 1,
                 "width": width,
                 "height": height,
             },
