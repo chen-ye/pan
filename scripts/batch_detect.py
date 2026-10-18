@@ -543,37 +543,64 @@ def main() -> None:
     try:
         for video_path in pbar_videos:
             pbar_videos.set_postfix_str(video_path.name[:25])
-            try:
-                data, det_count = process_video_with_dali(
-                    video_path=video_path,
-                    model=model,
-                    base_dir=base_dir,
-                    batch_size=args.batch_size,
-                    conf_threshold=args.conf,
-                    target_size=args.target_size,
-                    frame_fps=args.frame_fps,
-                    pbar_frames=pbar_frames,
-                )
-                save_detection_json(video_path, data)
-                processed_count += 1
-                total_detections += det_count
-                if data.get("partial"):
-                    partial_count += 1
+            max_net_retries = 10
+            net_retry_count = 0
+            while True:
+                try:
+                    data, det_count = process_video_with_dali(
+                        video_path=video_path,
+                        model=model,
+                        base_dir=base_dir,
+                        batch_size=args.batch_size,
+                        conf_threshold=args.conf,
+                        target_size=args.target_size,
+                        frame_fps=args.frame_fps,
+                        pbar_frames=pbar_frames,
+                    )
+                    save_detection_json(video_path, data)
+                    processed_count += 1
+                    total_detections += det_count
+                    if data.get("partial"):
+                        partial_count += 1
 
-                if det_count == 0:
-                    blank_count += 1
-                    if move_blank_dir:
-                        dest = move_file_and_sidecars(video_path, move_blank_dir, base_dir=base_dir)
-                        logger.info("Moved blank video to %s", dest)
-                else:
-                    detected_count += 1
-                    if move_detected_dir:
-                        dest = move_file_and_sidecars(video_path, move_detected_dir, base_dir=base_dir)
-                        logger.info("Moved detected video to %s", dest)
+                    if det_count == 0:
+                        blank_count += 1
+                        if move_blank_dir:
+                            dest = move_file_and_sidecars(video_path, move_blank_dir, base_dir=base_dir)
+                            logger.info("Moved blank video to %s", dest)
+                    else:
+                        detected_count += 1
+                        if move_detected_dir:
+                            dest = move_file_and_sidecars(video_path, move_detected_dir, base_dir=base_dir)
+                            logger.info("Moved detected video to %s", dest)
+                    break
 
-            except Exception as e:  # noqa: BLE001
-                error_count += 1
-                logger.error("Error processing %s via DALI: %s", video_path, e)
+                except Exception as e:  # noqa: BLE001
+                    err_str = str(e)
+                    is_net_error = (
+                        "Host is down" in err_str
+                        or "Network is unreachable" in err_str
+                        or "Connection reset" in err_str
+                        or "Input/output error" in err_str
+                        or "No such device" in err_str
+                    )
+                    if is_net_error and net_retry_count < max_net_retries:
+                        net_retry_count += 1
+                        wait_sec = min(15 * net_retry_count, 120)
+                        logger.warning(
+                            "Storage network error on %s (%s). Waiting %ds for mount recovery (retry %d/%d)...",
+                            video_path.name,
+                            err_str.splitlines()[-1] if err_str else "Host down",
+                            wait_sec,
+                            net_retry_count,
+                            max_net_retries,
+                        )
+                        time.sleep(wait_sec)
+                        continue
+
+                    error_count += 1
+                    logger.error("Error processing %s via DALI: %s", video_path, e)
+                    break
 
     except KeyboardInterrupt:
         logger.warning("\nProcessing interrupted by user (Ctrl+C). Exiting...")
