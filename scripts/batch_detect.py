@@ -683,6 +683,26 @@ def process_single_video(
                 time.sleep(wait_sec)
                 continue
 
+            is_cuda_fault = (
+                "cudaerrorunknown" in err_str.lower()
+                or "cuda_error_unknown" in err_str.lower()
+                or "cuda error: unknown error" in err_str.lower()
+                or "cuda error: an illegal memory access" in err_str.lower()
+                or "cuStreamSynchronize" in err_str
+            )
+            if is_cuda_fault:
+                logger.error(
+                    "Fatal unrecoverable CUDA driver fault on %s: %s",
+                    video_path.name,
+                    err_str,
+                )
+                logger.warning("Recycling process via os.execve to restore clean CUDA context and resume pipeline...")
+                prewarmer.stop()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                time.sleep(2.0)
+                os.execve(sys.executable, [sys.executable, *sys.argv], os.environ.copy())
+
             logger.error("Error processing %s: %s", video_path, e)
             return {"success": False, "error": str(e)}
 

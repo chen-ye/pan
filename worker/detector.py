@@ -25,6 +25,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_CORRUPTED_PIPELINES: list[Any] = []
+
 
 class DaliVideoDecoder:
     """Hardware-accelerated video decoder using NVIDIA DALI and NVDEC."""
@@ -124,11 +126,22 @@ class DaliVideoDecoder:
 
         return frames, fnums, timestamps
 
+    def mark_corrupted(self) -> None:
+        """Flag that CUDA context or pipeline is in an unrecoverable error state."""
+        self._is_corrupted = True
+
     def close(self) -> None:
         """Release DALI pipeline and terminate background C++ prefetch worker threads."""
         pipe = getattr(self, "pipe", None)
         if pipe is not None:
             self.pipe = None
+            if getattr(self, "_is_corrupted", False):
+                # When CUDA context or DALI pipeline is corrupted, calling _shutdown()
+                # or invoking ~Pipeline() destructor causes DALI to throw dali::CUDAError
+                # inside a C++ destructor, which triggers std::terminate() and aborts the process.
+                # Retaining a reference prevents destructor execution during error recovery.
+                _CORRUPTED_PIPELINES.append(pipe)
+                return
             try:
                 if hasattr(pipe, "_shutdown"):
                     pipe._shutdown()
@@ -167,14 +180,26 @@ class TorchVisionMegaDetector:
             self.device = device
 
         self.fp16 = bool(fp16 and self.device.type == "cuda")
-        force_cpu = self.device.type == "cpu"
+        local_model_candidates = [
+            Path(self.model_version),
+            Path("/app/models/md_v1000.0.0-redwood.pt"),
+            Path(__file__).resolve().parent.parent / "models" / "md_v1000.0.0-redwood.pt",
+        ]
+        target_model = self.model_version
+        for cand in local_model_candidates:
+            if cand.is_file():
+                target_model = str(cand)
+                break
+
         logger.info(
-            "Loading MegaDetector model '%s' (device: %s, fp16: %s)...",
+            "Loading MegaDetector model '%s' (resolved: %s, device: %s, fp16: %s)...",
             self.model_version,
+            target_model,
             self.device,
             self.fp16,
         )
-        base_detector = run_detector.load_detector(self.model_version, force_cpu=force_cpu)
+        force_cpu = self.device.type == "cpu"
+        base_detector = run_detector.load_detector(target_model, force_cpu=force_cpu)
 
         # Extract underlying YOLOv5 DetectionModel
         self.model = base_detector.model.to(self.device).eval()
@@ -716,6 +741,8 @@ class VideoProcessor:
                         current_batch_size = new_batch
                         break
                     logger.error("Error during inference on %s: %s", target_file, err)
+                    if decoder is not None and ("cuda" in err_str.lower() or "dali" in err_str.lower()):
+                        decoder.mark_corrupted()
                     yield {"error": f"Error during inference: {err}"}
                     return
 

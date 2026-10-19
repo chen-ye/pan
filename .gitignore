@@ -158,3 +158,7 @@ test-results/
 # OS metadata
 ._*
 .DS_Store
+
+# Model weights
+models/*.pt
+models/*.onnx
