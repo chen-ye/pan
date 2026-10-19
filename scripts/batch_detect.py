@@ -19,15 +19,24 @@
 """Batch MegaDetector video processing CLI for Pan NVR.
 
 Processes video files using NVIDIA DALI NVDEC for hardware frame decoding and
-TorchVision MegaDetector for GPU inference, matching Pan UI's exact metadata format.
+TorchVision MegaDetector for GPU inference, with a high-throughput multi-pass BFS
+screening funnel and post-screening annotation pass.
 """
 
+import argparse
+import concurrent.futures
+import logging
 import os
+import shutil
 import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
 
 # Ensure shared libraries (e.g. Homebrew FFmpeg) are discoverable by ld.so before loading C extensions.
 BREW_LIB = "/home/linuxbrew/.linuxbrew/lib"
-if os.path.isdir(BREW_LIB):
+if __name__ == "__main__" and os.path.isdir(BREW_LIB):
     current_ld = os.environ.get("LD_LIBRARY_PATH", "")
     if BREW_LIB not in current_ld.split(":") and os.environ.get("_PAN_REEXEC") != "1":
         new_env = os.environ.copy()
@@ -35,19 +44,15 @@ if os.path.isdir(BREW_LIB):
         new_env["_PAN_REEXEC"] = "1"
         os.execve(sys.executable, [sys.executable, *sys.argv], new_env)
 
-import argparse
-import logging
-import shutil
-import threading
-import time
-from pathlib import Path
-from typing import Any
-
 import torch
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "worker"))
 from detector import VideoProcessor
+from screening import (
+    ScreeningState,
+    SidecarScreeningManager,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,11 +96,19 @@ class VfsPrewarmer:
 
 
 class VideoItem:
-    """Represents a discovered video and its pre-checked processing status."""
+    """Represents a discovered video and its screening state."""
 
-    def __init__(self, path: Path, already_processed: bool) -> None:
+    def __init__(
+        self,
+        path: Path,
+        sidecar_path: Path | None = None,
+        already_processed: bool = False,
+        screening_state: ScreeningState | None = None,
+    ) -> None:
         self.path = path
+        self.sidecar_path = sidecar_path or Path(f"{path}.json")
         self.already_processed = already_processed
+        self.screening_state = screening_state
 
 
 def fast_scan_video_library(
@@ -151,9 +164,20 @@ def fast_scan_video_library(
 
             v_name = v_entry.name
             v_stem = os.path.splitext(v_name)[0]
-            is_processed = (f"{v_name}.json" in json_filenames) or (f"{v_stem}.json" in json_filenames)
+            sidecar_file: Path | None = None
+            if f"{v_name}.json" in json_filenames:
+                sidecar_file = Path(v_entry.path).parent / f"{v_name}.json"
+            elif f"{v_stem}.json" in json_filenames:
+                sidecar_file = Path(v_entry.path).parent / f"{v_stem}.json"
 
-            items.append(VideoItem(Path(v_entry.path), is_processed))
+            is_processed = sidecar_file is not None
+            items.append(
+                VideoItem(
+                    path=Path(v_entry.path),
+                    sidecar_path=sidecar_file or Path(f"{v_entry.path}.json"),
+                    already_processed=is_processed,
+                )
+            )
 
         for subdir in subdirs:
             scan_dir(subdir)
@@ -172,7 +196,7 @@ def fast_scan_video_library(
                             seen.add(f_str)
                             sidecar = Path(f"{f}.json")
                             is_proc = sidecar.exists() and sidecar.stat().st_size > 0
-                            items.append(VideoItem(f.resolve(), is_proc))
+                            items.append(VideoItem(f.resolve(), sidecar_path=sidecar, already_processed=is_proc))
                 continue
             logger.warning("Path does not exist: %s", p_str)
             continue
@@ -183,12 +207,106 @@ def fast_scan_video_library(
                 seen.add(p_str)
                 sidecar = Path(f"{p}.json")
                 is_proc = sidecar.exists() and sidecar.stat().st_size > 0
-                items.append(VideoItem(p, is_proc))
+                items.append(VideoItem(p, sidecar_path=sidecar, already_processed=is_proc))
         elif p.is_dir():
             scan_dir(str(p))
 
     items.sort(key=lambda item: str(item.path))
     return items
+
+
+def populate_screening_states(items: list[VideoItem]) -> None:
+    """Load screening states for all discovered items in parallel."""
+    items_with_sidecars = [it for it in items if it.already_processed]
+    if not items_with_sidecars:
+        return
+
+    def _load(it: VideoItem) -> None:
+        try:
+            _, state = SidecarScreeningManager.load_sidecar(it.sidecar_path)
+            it.screening_state = state
+        except Exception as err:  # noqa: BLE001
+            logger.debug("Failed to read screening state for %s: %s", it.sidecar_path, err)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        list(executor.map(_load, items_with_sidecars))
+
+
+def has_completed_stride_or_finer(state: ScreeningState | None, target_stride: int) -> bool:
+    """Check if state has already been evaluated across full video at target_stride or finer."""
+    if not state or not state.strides_completed:
+        return False
+    return min(state.strides_completed) <= target_stride
+
+
+def get_pass_candidates(
+    items: list[VideoItem],
+    strides: list[int],
+    pass_index: int,
+    force: bool = False,
+) -> list[VideoItem]:
+    """Determine eligible videos for a screening pass at the given stride index."""
+    if pass_index >= len(strides):
+        return []
+    stride = strides[pass_index]
+    candidates: list[VideoItem] = []
+    for it in items:
+        if force:
+            candidates.append(it)
+            continue
+
+        state = it.screening_state
+        if state is None:
+            # Completely unprocessed: eligible for Pass 1 only
+            if pass_index == 0:
+                candidates.append(it)
+            continue
+
+        if state.status == "annotated":
+            continue
+
+        if state.status == "detected":
+            # Detected videos wait for annotation phase
+            continue
+
+        if state.status == "blank":
+            # Must have completed previous stride if this is not Pass 1
+            if pass_index > 0:
+                prev_stride = strides[pass_index - 1]
+                if not has_completed_stride_or_finer(state, prev_stride):
+                    continue
+
+            # Must not have already completed this stride or finer
+            if has_completed_stride_or_finer(state, stride):
+                continue
+
+            candidates.append(it)
+
+    return candidates
+
+
+def get_annotation_candidates(
+    items: list[VideoItem],
+    force: bool = False,
+) -> list[VideoItem]:
+    """Determine videos that have detections and need full annotation backfill."""
+    candidates: list[VideoItem] = []
+    for it in items:
+        if force:
+            candidates.append(it)
+            continue
+
+        state = it.screening_state
+        if state is None:
+            continue
+
+        if state.status == "annotated":
+            continue
+
+        if state.status == "detected" or state.early_exit:
+            candidates.append(it)
+
+    return candidates
 
 
 def move_file_and_sidecars(
@@ -229,9 +347,127 @@ def move_file_and_sidecars(
     return target_video
 
 
+def process_single_video(
+    processor: VideoProcessor,
+    item: VideoItem,
+    step: int | None,
+    early_exit: bool,
+    is_annotation_pass: bool,
+    base_dir: Path | None,
+    batch_size: int | str,
+    conf: float,
+    target_size: int,
+    pbar_frames: tqdm,
+    prewarmer: VfsPrewarmer,
+    next_item: VideoItem | None,
+) -> dict[str, Any]:
+    """Execute inference on a single video with network retries and state updates."""
+    video_path = item.path
+    if next_item is not None:
+        prewarmer.prewarm(next_item.path)
+
+    max_net_retries = 10
+    net_retry_count = 0
+
+    ranges_to_skip = item.screening_state.evaluated_ranges if item.screening_state else None
+
+    while True:
+        try:
+            det_count = 0
+            result_data: dict[str, Any] = {}
+            is_error = False
+            err_msg = ""
+            final_status = ""
+            is_early_exit = False
+
+            for chunk in processor.process_video_stream(
+                video_path=video_path,
+                base_dir=base_dir,
+                batch_size=batch_size,
+                conf_threshold=conf,
+                target_size=target_size,
+                step=step,
+                early_exit=early_exit,
+                screening_ranges=ranges_to_skip,
+                is_annotation_pass=is_annotation_pass,
+            ):
+                status = chunk.get("status")
+                if status == "starting":
+                    total_samples = chunk.get("total_samples", 0)
+                    active_b = chunk.get("batch_size", batch_size)
+                    pbar_frames.reset(total=total_samples)
+                    pbar_frames.set_description(f"Frames [DALI b={active_b}]: {video_path.name[:20]}")
+                elif status == "progress":
+                    pbar_frames.update(chunk.get("batch_samples", 0))
+                elif status == "early_exit":
+                    is_early_exit = True
+                elif status == "complete":
+                    det_count = chunk.get("detections_count", 0)
+                    result_data = chunk.get("result_data", {})
+                    final_status = chunk.get("screening_status", "")
+                    active_b = chunk.get("batch_size", batch_size)
+                    logger.info(
+                        "Finished %s: %d detections (status=%s, early_exit=%s, batch=%s)",
+                        video_path.name,
+                        det_count,
+                        final_status,
+                        chunk.get("early_exit", False),
+                        active_b,
+                    )
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                elif "error" in chunk:
+                    is_error = True
+                    err_msg = chunk["error"]
+
+            if is_error:
+                raise RuntimeError(err_msg)
+
+            # Update item's screening state in-memory
+            screening_dict = result_data.get("info", {}).get("screening")
+            if screening_dict:
+                item.screening_state = ScreeningState.from_dict(screening_dict)
+            item.already_processed = True
+
+            return {
+                "success": True,
+                "detections_count": det_count,
+                "screening_status": final_status,
+                "early_exit": is_early_exit,
+                "partial": result_data.get("images", [{}])[0].get("partial", False),
+                "result_data": result_data,
+            }
+
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e)
+            is_net_error = (
+                "Host is down" in err_str
+                or "Network is unreachable" in err_str
+                or "Connection reset" in err_str
+                or "Input/output error" in err_str
+                or "No such device" in err_str
+            )
+            if is_net_error and net_retry_count < max_net_retries:
+                net_retry_count += 1
+                wait_sec = min(15 * net_retry_count, 120)
+                logger.warning(
+                    "Storage network error on %s (%s). Waiting %ds for mount recovery (retry %d/%d)...",
+                    video_path.name,
+                    err_str.splitlines()[-1] if err_str else "Host down",
+                    wait_sec,
+                    net_retry_count,
+                    max_net_retries,
+                )
+                time.sleep(wait_sec)
+                continue
+
+            logger.error("Error processing %s: %s", video_path, e)
+            return {"success": False, "error": str(e)}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch MegaDetector video processor matching Pan NVR format (using NVIDIA DALI NVDEC).",
+        description="Batch MegaDetector video processor with Multi-Pass BFS Screening (NVIDIA DALI NVDEC).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -259,13 +495,43 @@ def parse_args() -> argparse.Namespace:
         "--skip-existing",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Skip videos that already have a valid .json sidecar.",
+        help="Skip videos that already have completed screening/annotation.",
     )
     parser.add_argument(
         "-f",
         "--force",
         action="store_true",
         help="Force re-processing of all videos, ignoring existing sidecars (overrides --skip-existing).",
+    )
+    parser.add_argument(
+        "--strides",
+        type=str,
+        default="24,4,1",
+        help="Comma-separated strides for multi-pass BFS screening (e.g. '24,4,1').",
+    )
+    parser.add_argument(
+        "--annotate-stride",
+        type=int,
+        default=4,
+        help="Target frame stride for post-screening annotation backfill pass.",
+    )
+    parser.add_argument(
+        "--skip-annotation",
+        action="store_true",
+        help="Only run screening passes; skip the post-screening annotation backfill pass.",
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        choices=["auto", "1", "2", "3", "annotate", "legacy"],
+        default="auto",
+        help="Execution stage: 'auto' runs full BFS funnel, '1'/'2'/'3' runs specific pass, 'annotate' runs annotation backfill, 'legacy' runs single-pass detect.",
+    )
+    parser.add_argument(
+        "--early-exit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable early exit on first positive detection during screening passes.",
     )
     parser.add_argument(
         "--batch-size",
@@ -301,7 +567,7 @@ def parse_args() -> argparse.Namespace:
         "--frame-fps",
         type=float,
         default=4.0,
-        help="Target sampling rate (fps) to extract frames for detection.",
+        help="Target sampling rate (fps) for legacy single-pass mode.",
     )
     parser.add_argument(
         "--base-dir",
@@ -313,13 +579,13 @@ def parse_args() -> argparse.Namespace:
         "--move-blank-to",
         type=str,
         default="",
-        help="Optional destination directory to move videos and sidecars with 0 detections.",
+        help="Optional destination directory to move videos and sidecars with 0 detections (certified blanks).",
     )
     parser.add_argument(
         "--move-detected-to",
         type=str,
         default="",
-        help="Optional destination directory to move videos and sidecars with >=1 detection.",
+        help="Optional destination directory to move videos and sidecars with >=1 detection (annotated).",
     )
     parser.add_argument(
         "--no-fp16",
@@ -331,7 +597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview files to process and actions to take without running inference or moving files.",
+        help="Preview queues and passes without executing inference or modifying files.",
     )
 
     return parser.parse_args()
@@ -368,40 +634,89 @@ def main() -> None:
         logger.warning("No video files found matching the specified inputs.")
         sys.exit(0)
 
-    logger.info("Discovered %d video file(s) in %.2fs.", len(discovered_items), scan_time)
+    logger.info("Discovered %d video file(s) in %.2fs. Loading sidecar metadata...", len(discovered_items), scan_time)
+    start_load_meta = time.time()
+    populate_screening_states(discovered_items)
+    logger.info("Loaded sidecar metadata in %.2fs.", time.time() - start_load_meta)
 
-    skip_existing = args.skip_existing and not args.force
-    videos_to_process: list[Path] = []
-    skipped_count = 0
+    # Parse screening strides
+    strides: list[int] = []
+    for s_str in args.strides.split(","):
+        s_str = s_str.strip()
+        if s_str:
+            try:
+                val = int(s_str)
+                if val > 0:
+                    strides.append(val)
+            except ValueError:
+                logger.warning("Invalid stride value ignored: %s", s_str)
+    if not strides:
+        strides = [24, 4, 1]
 
-    for item in discovered_items:
-        if skip_existing and item.already_processed:
-            skipped_count += 1
-        else:
-            videos_to_process.append(item.path)
+    # Queue breakdowns
+    p1_candidates = get_pass_candidates(discovered_items, strides=strides, pass_index=0, force=args.force)
+    p2_candidates = (
+        get_pass_candidates(discovered_items, strides=strides, pass_index=1, force=args.force)
+        if len(strides) > 1
+        else []
+    )
+    p3_candidates = (
+        get_pass_candidates(discovered_items, strides=strides, pass_index=2, force=args.force)
+        if len(strides) > 2
+        else []
+    )
+    anno_candidates = get_annotation_candidates(discovered_items, force=args.force)
+
+    certified_blanks = [
+        it
+        for it in discovered_items
+        if it.screening_state
+        and it.screening_state.status == "blank"
+        and all(has_completed_stride_or_finer(it.screening_state, s) for s in strides)
+    ]
+    annotated_videos = [
+        it for it in discovered_items if it.screening_state and it.screening_state.status == "annotated"
+    ]
 
     logger.info(
-        "Queue summary: %d to process, %d already processed (skipped).",
-        len(videos_to_process),
-        skipped_count,
+        "Library status: %d certified blank, %d fully annotated, %d detected (awaiting annotation).",
+        len(certified_blanks),
+        len(annotated_videos),
+        len(anno_candidates),
+    )
+    logger.info(
+        "Funnel queues: Pass 1 (stride %d): %d | Pass 2 (stride %d): %d | Pass 3 (stride %d): %d | Annotation: %d",
+        strides[0],
+        len(p1_candidates),
+        strides[1] if len(strides) > 1 else 0,
+        len(p2_candidates),
+        strides[2] if len(strides) > 2 else 0,
+        len(p3_candidates),
+        len(anno_candidates),
     )
 
     if args.dry_run:
-        logger.info("[DRY RUN] Previewing %d file(s) to process:", len(videos_to_process))
-        for v in videos_to_process[:20]:
-            print(f"  - {v}")
-        if len(videos_to_process) > 20:
-            print(f"  ... and {len(videos_to_process) - 20} more videos.")
-        if args.move_blank_to:
-            logger.info("[DRY RUN] Videos with 0 detections would be moved to: %s", args.move_blank_to)
-        if args.move_detected_to:
-            logger.info("[DRY RUN] Videos with >=1 detection would be moved to: %s", args.move_detected_to)
+        logger.info("[DRY RUN] Stage selected: %s", args.stage)
+        logger.info("[DRY RUN] Strides: %s | Annotate stride: %d", strides, args.annotate_stride)
+        if p1_candidates:
+            logger.info("  Pass 1 sample candidates (stride %d):", strides[0])
+            for it in p1_candidates[:5]:
+                print(f"    - {it.path.name}")
+        if p2_candidates:
+            logger.info("  Pass 2 sample candidates (stride %d):", strides[1])
+            for it in p2_candidates[:5]:
+                print(f"    - {it.path.name}")
+        if p3_candidates:
+            logger.info("  Pass 3 sample candidates (stride %d):", strides[2])
+            for it in p3_candidates[:5]:
+                print(f"    - {it.path.name}")
+        if anno_candidates:
+            logger.info("  Annotation sample candidates:")
+            for it in anno_candidates[:5]:
+                print(f"    - {it.path.name}")
         sys.exit(0)
 
-    if not videos_to_process:
-        logger.info("All videos are already processed. Nothing to do.")
-        sys.exit(0)
-
+    # Initialize GPU / inference device
     target_device: torch.device
     if args.device:
         if args.device.lower() == "cpu":
@@ -422,12 +737,9 @@ def main() -> None:
         target_device = torch.device("cpu")
         logger.info("CUDA not available. Using CPU.")
 
-    logger.info("Decoder backend: NVIDIA DALI (hardware NVDEC)")
     use_fp16 = bool(args.fp16 and target_device.type == "cuda")
-    logger.info(
-        "Inference engine: TorchVisionMegaDetector (pure GPU tensor pipeline, fp16=%s)",
-        use_fp16,
-    )
+    logger.info("Decoder backend: NVIDIA DALI (hardware NVDEC)")
+    logger.info("Inference engine: TorchVisionMegaDetector (fp16=%s)", use_fp16)
 
     logger.info("Initializing VideoProcessor with model '%s' (batch_size=%s)...", args.model, args.batch_size)
     start_load = time.time()
@@ -448,132 +760,158 @@ def main() -> None:
         Path(args.move_detected_to).expanduser().resolve() if args.move_detected_to else None
     )
 
-    processed_count = 0
-    blank_count = 0
-    detected_count = 0
-    partial_count = 0
-    total_detections = 0
-    error_count = 0
+    prewarmer = VfsPrewarmer()
+    pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
     start_time = time.time()
 
-    pbar_videos = tqdm(videos_to_process, desc="Videos", unit="vid")
-    pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
-    prewarmer = VfsPrewarmer()
+    # Track metrics across passes
+    pass_metrics: dict[str, dict[str, int]] = {}
+
+    def run_pass(
+        queue: list[VideoItem],
+        pass_name: str,
+        step: int | None,
+        early_exit: bool,
+        is_annotation: bool,
+    ) -> None:
+        if not queue:
+            logger.info("=== %s: 0 videos in queue. Skipping. ===", pass_name)
+            return
+
+        logger.info("=== %s: Processing %d video(s) (stride=%s, early_exit=%s) ===", pass_name, len(queue), step, early_exit)
+        metrics = {"processed": 0, "blank": 0, "detected": 0, "annotated": 0, "errors": 0}
+
+        pbar_vids = tqdm(queue, desc=pass_name, unit="vid")
+        try:
+            for i_vid, item in enumerate(pbar_vids):
+                pbar_vids.set_postfix_str(item.path.name[:25])
+                next_item = queue[i_vid + 1] if i_vid + 1 < len(queue) else None
+
+                res = process_single_video(
+                    processor=processor,
+                    item=item,
+                    step=step,
+                    early_exit=early_exit,
+                    is_annotation_pass=is_annotation,
+                    base_dir=base_dir,
+                    batch_size=args.batch_size,
+                    conf=args.conf,
+                    target_size=args.target_size,
+                    pbar_frames=pbar_frames,
+                    prewarmer=prewarmer,
+                    next_item=next_item,
+                )
+
+                if res.get("success"):
+                    metrics["processed"] += 1
+                    status = res.get("screening_status", "")
+                    if status == "blank":
+                        metrics["blank"] += 1
+                    elif status == "detected":
+                        metrics["detected"] += 1
+                    elif status == "annotated":
+                        metrics["annotated"] += 1
+                else:
+                    metrics["errors"] += 1
+
+        finally:
+            pbar_vids.close()
+
+        pass_metrics[pass_name] = metrics
 
     try:
-        for i_vid, video_path in enumerate(pbar_videos):
-            pbar_videos.set_postfix_str(video_path.name[:25])
-            # Pre-warm the next video in background to populate rclone VFS cache
-            if i_vid + 1 < len(videos_to_process):
-                prewarmer.prewarm(videos_to_process[i_vid + 1])
+        if args.stage == "legacy":
+            # Legacy single-pass mode
+            legacy_queue = [it for it in discovered_items if args.force or not it.already_processed]
+            legacy_step = max(int(12.0 / args.frame_fps), 1)
+            run_pass(
+                legacy_queue,
+                pass_name="Legacy Detect",
+                step=legacy_step,
+                early_exit=False,
+                is_annotation=False,
+            )
+        else:
+            # Multi-Pass BFS Screening Funnel
+            stages_to_run: list[tuple[str, int, int]] = []
+            if args.stage == "auto":
+                for idx, stride in enumerate(strides):
+                    stages_to_run.append((f"Pass {idx + 1}/{len(strides)} (Stride {stride})", idx, stride))
+            elif args.stage in {"1", "2", "3"}:
+                pass_idx = int(args.stage) - 1
+                if pass_idx < len(strides):
+                    stages_to_run.append((f"Pass {args.stage} (Stride {strides[pass_idx]})", pass_idx, strides[pass_idx]))
+                else:
+                    logger.error("Requested stage '%s' exceeds configured strides %s.", args.stage, strides)
+                    sys.exit(1)
 
-            max_net_retries = 10
-            net_retry_count = 0
-            while True:
-                try:
-                    det_count = 0
-                    result_data: dict[str, Any] = {}
-                    is_error = False
-                    err_msg = ""
+            # Execute scheduled screening passes
+            for pass_title, pass_idx, stride in stages_to_run:
+                # Re-evaluate candidates dynamically from current states
+                candidates = get_pass_candidates(discovered_items, strides=strides, pass_index=pass_idx, force=args.force)
+                run_pass(
+                    candidates,
+                    pass_name=pass_title,
+                    step=stride,
+                    early_exit=args.early_exit,
+                    is_annotation=False,
+                )
 
-                    for chunk in processor.process_video_stream(
-                        video_path=video_path,
-                        base_dir=base_dir,
-                        batch_size=args.batch_size,
-                        conf_threshold=args.conf,
-                        target_size=args.target_size,
-                        frame_fps=args.frame_fps,
+            # Check for certified blanks to move if requested
+            if move_blank_dir and (args.stage in {"auto", "3"} or len(strides) == 1):
+                logger.info("Moving certified blank videos to %s...", move_blank_dir)
+                moved_blanks = 0
+                for it in discovered_items:
+                    if (
+                        it.screening_state
+                        and it.screening_state.status == "blank"
+                        and all(has_completed_stride_or_finer(it.screening_state, s) for s in strides)
                     ):
-                        status = chunk.get("status")
-                        if status == "starting":
-                            total_samples = chunk.get("total_samples", 0)
-                            active_b = chunk.get("batch_size", args.batch_size)
-                            pbar_frames.reset(total=total_samples)
-                            pbar_frames.set_description(f"Frames [DALI b={active_b}]: {video_path.name[:20]}")
-                        elif status == "progress":
-                            pbar_frames.update(chunk.get("batch_samples", 0))
-                        elif status == "complete":
-                            det_count = chunk.get("detections_count", 0)
-                            result_data = chunk.get("result_data", {})
-                            active_b = chunk.get("batch_size", args.batch_size)
-                            logger.info(
-                                "Finished %s: %d detections (batch=%s)",
-                                video_path.name,
-                                det_count,
-                                active_b,
-                            )
-                            sys.stdout.flush()
-                            sys.stderr.flush()
-                        elif "error" in chunk:
-                            is_error = True
-                            err_msg = chunk["error"]
+                        move_file_and_sidecars(it.path, move_blank_dir, base_dir=base_dir)
+                        moved_blanks += 1
+                logger.info("Moved %d certified blank video(s).", moved_blanks)
 
-                    if is_error:
-                        raise RuntimeError(err_msg)
+            # Annotation Phase
+            should_run_annotation = (args.stage == "auto" and not args.skip_annotation) or (args.stage == "annotate")
+            if should_run_annotation:
+                anno_candidates = get_annotation_candidates(discovered_items, force=args.force)
+                run_pass(
+                    anno_candidates,
+                    pass_name=f"Annotation Phase (Stride {args.annotate_stride})",
+                    step=args.annotate_stride,
+                    early_exit=False,
+                    is_annotation_pass=True,
+                )
 
-                    processed_count += 1
-                    total_detections += det_count
-                    if result_data.get("images", [{}])[0].get("partial"):
-                        partial_count += 1
-
-                    if det_count == 0:
-                        blank_count += 1
-                        if move_blank_dir:
-                            dest = move_file_and_sidecars(video_path, move_blank_dir, base_dir=base_dir)
-                            logger.info("Moved blank video to %s", dest)
-                    else:
-                        detected_count += 1
-                        if move_detected_dir:
-                            dest = move_file_and_sidecars(video_path, move_detected_dir, base_dir=base_dir)
-                            logger.info("Moved detected video to %s", dest)
-                    break
-
-                except Exception as e:  # noqa: BLE001
-                    err_str = str(e)
-                    is_net_error = (
-                        "Host is down" in err_str
-                        or "Network is unreachable" in err_str
-                        or "Connection reset" in err_str
-                        or "Input/output error" in err_str
-                        or "No such device" in err_str
-                    )
-                    if is_net_error and net_retry_count < max_net_retries:
-                        net_retry_count += 1
-                        wait_sec = min(15 * net_retry_count, 120)
-                        logger.warning(
-                            "Storage network error on %s (%s). Waiting %ds for mount recovery (retry %d/%d)...",
-                            video_path.name,
-                            err_str.splitlines()[-1] if err_str else "Host down",
-                            wait_sec,
-                            net_retry_count,
-                            max_net_retries,
-                        )
-                        time.sleep(wait_sec)
-                        continue
-
-                    error_count += 1
-                    logger.error("Error processing %s via DALI: %s", video_path, e)
-                    break
+                if move_detected_dir:
+                    logger.info("Moving annotated videos to %s...", move_detected_dir)
+                    moved_det = 0
+                    for it in discovered_items:
+                        if it.screening_state and it.screening_state.status in {"annotated", "detected"}:
+                            move_file_and_sidecars(it.path, move_detected_dir, base_dir=base_dir)
+                            moved_det += 1
+                    logger.info("Moved %d detected/annotated video(s).", moved_det)
 
     except KeyboardInterrupt:
-        logger.warning("\nProcessing interrupted by user (Ctrl+C). Exiting...")
+        logger.warning("\nProcessing interrupted by user (Ctrl+C). Cleaned up gracefully.")
     finally:
         prewarmer.stop()
         pbar_frames.close()
-        pbar_videos.close()
 
     elapsed = time.time() - start_time
     logger.info("=" * 60)
-    logger.info("BATCH PROCESSING SUMMARY (%.2fs)", elapsed)
-    logger.info("Total scanned:      %d", len(discovered_items))
-    logger.info("Already processed:  %d (skipped)", skipped_count)
-    logger.info("Newly processed:    %d", processed_count)
-    logger.info("  - Fully decoded:  %d", processed_count - partial_count)
-    logger.info("  - Partial (corrupt EOF): %d", partial_count)
-    logger.info("  - Blank (0 det):  %d", blank_count)
-    logger.info("  - Detections:     %d (%d total objects)", detected_count, total_detections)
-    if error_count > 0:
-        logger.warning("  - Errors:         %d", error_count)
+    logger.info("MULTI-PASS BFS SCREENING SUMMARY (%.2fs)", elapsed)
+    logger.info("Total videos discovered: %d", len(discovered_items))
+    for p_name, metrics in pass_metrics.items():
+        logger.info(
+            "  %s: %d processed | %d blank, %d detected, %d annotated, %d errors",
+            p_name,
+            metrics["processed"],
+            metrics["blank"],
+            metrics["detected"],
+            metrics["annotated"],
+            metrics["errors"],
+        )
     logger.info("=" * 60)
 
 

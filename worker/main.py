@@ -37,6 +37,12 @@ except Exception as e:  # noqa: BLE001
     logger.error("Failed to initialize VideoProcessor: %s", e)
 
 
+try:
+    from screening import SidecarScreeningManager
+except ImportError:
+    from worker.screening import SidecarScreeningManager
+
+
 @app.route("/process", methods=["POST"])
 def handle_process() -> tuple[Response, int] | Response:
     if processor is None:
@@ -55,6 +61,86 @@ def handle_process() -> tuple[Response, int] | Response:
             video_path,
             rel_path=rel_path,
             batch_size=batch_size,
+        ):
+            yield json.dumps(chunk) + "\n"
+            sys.stdout.flush()
+
+    response = Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/screen", methods=["POST"])
+def handle_screen() -> tuple[Response, int] | Response:
+    """Run progressive screening with early exit and prior frame range filtering."""
+    if processor is None:
+        return jsonify({"error": "VideoProcessor model not loaded"}), 500
+
+    data: dict[str, Any] = request.get_json(silent=True) or {}
+    rel_path = data.get("path")
+    if not rel_path:
+        return jsonify({"error": "No path provided"}), 400
+
+    stride = int(data.get("stride", 24))
+    early_exit = bool(data.get("early_exit", True))
+    conf_threshold = float(data.get("conf_threshold", 0.2))
+    batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
+
+    video_path = Path(DATA_DIR) / rel_path
+    json_path = Path(f"{video_path}.json")
+    _, state = SidecarScreeningManager.load_sidecar(json_path)
+    ranges = state.evaluated_ranges if state else None
+
+    def generate():
+        for chunk in processor.process_video_stream(
+            video_path,
+            rel_path=rel_path,
+            batch_size=batch_size,
+            step=stride,
+            early_exit=early_exit,
+            screening_ranges=ranges,
+            conf_threshold=conf_threshold,
+        ):
+            yield json.dumps(chunk) + "\n"
+            sys.stdout.flush()
+
+    response = Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/annotate", methods=["POST"])
+def handle_annotate() -> tuple[Response, int] | Response:
+    """Run post-screening annotation backfill on detected video without early exit."""
+    if processor is None:
+        return jsonify({"error": "VideoProcessor model not loaded"}), 500
+
+    data: dict[str, Any] = request.get_json(silent=True) or {}
+    rel_path = data.get("path")
+    if not rel_path:
+        return jsonify({"error": "No path provided"}), 400
+
+    stride = int(data.get("stride", 4))
+    conf_threshold = float(data.get("conf_threshold", 0.2))
+    batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
+
+    video_path = Path(DATA_DIR) / rel_path
+    json_path = Path(f"{video_path}.json")
+    _, state = SidecarScreeningManager.load_sidecar(json_path)
+    ranges = state.evaluated_ranges if state else None
+
+    def generate():
+        for chunk in processor.process_video_stream(
+            video_path,
+            rel_path=rel_path,
+            batch_size=batch_size,
+            step=stride,
+            early_exit=False,
+            screening_ranges=ranges,
+            is_annotation_pass=True,
+            conf_threshold=conf_threshold,
         ):
             yield json.dumps(chunk) + "\n"
             sys.stdout.flush()

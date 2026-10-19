@@ -4,7 +4,6 @@ import json
 import logging
 import os
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,15 @@ import torchvision.transforms.functional as TF
 from megadetector.detection import run_detector
 from nvidia.dali import fn, pipeline_def
 from torchvision import ops
+
+try:
+    from screening import EvaluatedRange, SidecarScreeningManager, is_frame_evaluated
+except ImportError:
+    from worker.screening import (
+        EvaluatedRange,
+        SidecarScreeningManager,
+        is_frame_evaluated,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -500,6 +508,10 @@ class VideoProcessor:
         conf_threshold: float = 0.2,
         frame_fps: float = 4.0,
         target_size: int = 1280,
+        step: int | None = None,
+        early_exit: bool = False,
+        screening_ranges: list[EvaluatedRange] | None = None,
+        is_annotation_pass: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """Process a video file, yielding NDJSON status dicts as processing advances."""
         target_file = Path(video_path).resolve()
@@ -529,7 +541,7 @@ class VideoProcessor:
             current_batch_size,
         )
 
-        step = max(int(12.0 / frame_fps), 1)
+        actual_step = max(int(step), 1) if step is not None else max(int(12.0 / frame_fps), 1)
         max_oom_retries = 2
 
         for attempt in range(max_oom_retries + 1):
@@ -538,7 +550,7 @@ class VideoProcessor:
                 try:
                     decoder = DaliVideoDecoder(
                         target_file,
-                        step=step,
+                        step=actual_step,
                         batch_size=current_batch_size,
                         device_id=max(self.device_id, 0),
                     )
@@ -556,8 +568,9 @@ class VideoProcessor:
                     "status": "starting",
                     "path": str(target_file),
                     "total_samples": total_sample_frames,
-                    "total_frames": total_sample_frames * step,
+                    "total_frames": total_sample_frames * actual_step,
                     "batch_size": current_batch_size,
+                    "step": actual_step,
                 }
 
                 results_list: list[dict[str, Any]] = []
@@ -566,6 +579,8 @@ class VideoProcessor:
                 last_frame_num = 0
                 last_timestamp = 0.0
                 oom_occurred = False
+                early_exit_occurred = False
+                early_exit_frame: int | None = None
 
                 try:
                     for frames, fnums, timestamps in decoder:
@@ -573,15 +588,39 @@ class VideoProcessor:
                             height = frames.shape[1]
                             width = frames.shape[2]
 
+                        # Skip frames already evaluated in prior passes
+                        if screening_ranges:
+                            unevaluated_mask = [not is_frame_evaluated(fn, screening_ranges) for fn in fnums]
+                            if not any(unevaluated_mask):
+                                last_frame_num = fnums[-1]
+                                last_timestamp = timestamps[-1]
+                                progress = min(decoder.samples_read / max(total_sample_frames, 1), 1.0)
+                                yield {
+                                    "status": "progress",
+                                    "progress": round(progress, 3),
+                                    "frame": last_frame_num,
+                                    "batch_samples": len(fnums),
+                                    "total_frames": total_sample_frames * actual_step,
+                                }
+                                continue
+
+                            active_frames = frames[unevaluated_mask]
+                            active_fnums = [f for f, m in zip(fnums, unevaluated_mask) if m]
+                            active_ts = [t for t, m in zip(timestamps, unevaluated_mask) if m]
+                        else:
+                            active_frames = frames
+                            active_fnums = fnums
+                            active_ts = timestamps
+
                         batch_results = self.detector.generate_detections_one_batch(
-                            frames,
-                            image_ids=fnums,
+                            active_frames,
+                            image_ids=active_fnums,
                             detection_threshold=conf_threshold,
                         )
                         detections = extract_detections_from_batch(
                             batch_results,
                             conf_threshold=conf_threshold,
-                            timestamps=timestamps,
+                            timestamps=active_ts,
                         )
                         results_list.extend(detections)
 
@@ -594,8 +633,24 @@ class VideoProcessor:
                             "progress": round(progress, 3),
                             "frame": last_frame_num,
                             "batch_samples": len(fnums),
-                            "total_frames": total_sample_frames * step,
+                            "total_frames": total_sample_frames * actual_step,
                         }
+
+                        if early_exit and len(results_list) > 0:
+                            early_exit_occurred = True
+                            early_exit_frame = results_list[0].get("frame", last_frame_num)
+                            logger.info(
+                                "Early exit on %s at frame %d (%d detection(s)). Stopping decode.",
+                                target_file.name,
+                                early_exit_frame,
+                                len(results_list),
+                            )
+                            yield {
+                                "status": "early_exit",
+                                "frame": early_exit_frame,
+                                "detections_count": len(results_list),
+                            }
+                            break
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
                     err_str = str(err)
                     if (
@@ -625,56 +680,48 @@ class VideoProcessor:
 
                 fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
                 json_path = Path(f"{target_file}.json")
-                is_partial = decoder.is_partial or (0 < decoder.samples_read < total_sample_frames)
-                image_entry: dict[str, Any] = {
-                    "file": relative_video_name,
-                    "frame_rate": fps,
-                    "total_frames": last_frame_num + 1,
-                    "width": width,
-                    "height": height,
-                    "detections": results_list,
-                }
-                if is_partial:
-                    image_entry["partial"] = True
-                    if decoder.partial_reason:
-                        image_entry["partial_reason"] = decoder.partial_reason
-
-                output_data = {
-                    "info": {
-                        "format_version": "1.6",
-                        "detector": self.model_version,
-                        "detection_completion_time": datetime.now(UTC).isoformat(),
-                        "detector_metadata": {
-                            "image_size": target_size,
-                            "typical_detection_threshold": conf_threshold,
-                            "precision": "fp16" if getattr(self.detector, "fp16", False) else "fp32",
-                            "batch_size": current_batch_size,
-                        },
-                    },
-                    "detection_categories": getattr(
-                        self.detector,
-                        "categories",
-                        {"1": "animal", "2": "person", "3": "vehicle"},
-                    ),
-                    "images": [image_entry],
-                }
+                total_frames = max(last_frame_num + 1, total_sample_frames * actual_step)
+                new_range = EvaluatedRange(stride=actual_step, start=0, end=last_frame_num)
 
                 try:
-                    save_atomic_json(json_path, output_data)
+                    output_data = SidecarScreeningManager.merge_and_save_sidecar(
+                        json_path=json_path,
+                        relative_video_name=relative_video_name,
+                        width=width,
+                        height=height,
+                        fps=fps,
+                        total_frames=total_frames,
+                        new_detections=results_list,
+                        new_range=new_range,
+                        stride=actual_step,
+                        early_exit=early_exit_occurred,
+                        early_exit_frame=early_exit_frame,
+                        conf_threshold=conf_threshold,
+                        model_version=self.model_version,
+                        is_annotation_pass=is_annotation_pass,
+                    )
+                    det_count = len(output_data["images"][0]["detections"])
+                    is_partial = output_data["images"][0]["partial"]
+                    screening_info = output_data.get("info", {}).get("screening", {})
+                    screening_status = screening_info.get("status", "annotated" if not is_partial else "detected")
+
                     logger.info(
-                        "Saved results to %s (%d detections, partial=%s, batch_size=%d).",
+                        "Saved results to %s (%d detections, status=%s, partial=%s, batch_size=%d).",
                         json_path,
-                        len(results_list),
+                        det_count,
+                        screening_status,
                         is_partial,
                         current_batch_size,
                     )
                     yield {
                         "status": "complete",
                         "output": str(json_path),
-                        "detections_count": len(results_list),
+                        "detections_count": det_count,
+                        "screening_status": screening_status,
+                        "early_exit": early_exit_occurred,
                         "partial": is_partial,
                         "result_data": output_data,
-                        "detections": results_list,
+                        "detections": output_data["images"][0]["detections"],
                         "batch_size": current_batch_size,
                     }
                 except Exception as err:  # noqa: BLE001
