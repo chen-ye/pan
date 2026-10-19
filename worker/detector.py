@@ -1,5 +1,6 @@
 """Deep module for video detection using NVIDIA DALI hardware decoding and TorchVision MegaDetector."""
 
+import gc
 import json
 import logging
 import os
@@ -800,5 +801,16 @@ class VideoProcessor:
                     yield {"error": f"Failed to save results: {err}"}
                 break
             finally:
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                    except RuntimeError as err:
+                        logger.debug("CUDA synchronize error: %s", err)
                 if decoder is not None:
                     decoder.close()
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except RuntimeError as err:
+                        logger.debug("CUDA empty_cache error: %s", err)
+                gc.collect()

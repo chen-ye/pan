@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import gc
 import logging
 import os
 import shutil
@@ -705,6 +706,13 @@ def process_single_video(
 
             logger.error("Error processing %s: %s", video_path, e)
             return {"success": False, "error": str(e)}
+        finally:
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError as err:
+                    logger.debug("CUDA empty_cache error: %s", err)
+            gc.collect()
 
 
 def parse_args() -> argparse.Namespace:
