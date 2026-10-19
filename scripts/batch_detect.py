@@ -104,11 +104,13 @@ class VideoItem:
         sidecar_path: Path | None = None,
         already_processed: bool = False,
         screening_state: ScreeningState | None = None,
+        file_size: int | None = None,
     ) -> None:
         self.path = path
         self.sidecar_path = sidecar_path or Path(f"{path}.json")
         self.already_processed = already_processed
         self.screening_state = screening_state
+        self.file_size = file_size
 
 
 def fast_scan_video_library(
@@ -162,6 +164,12 @@ def fast_scan_video_library(
                 continue
             seen.add(v_entry.path)
 
+            v_size: int | None = None
+            try:
+                v_size = v_entry.stat().st_size
+            except OSError:
+                pass
+
             v_name = v_entry.name
             v_stem = os.path.splitext(v_name)[0]
             sidecar_file: Path | None = None
@@ -176,6 +184,7 @@ def fast_scan_video_library(
                     path=Path(v_entry.path),
                     sidecar_path=sidecar_file or Path(f"{v_entry.path}.json"),
                     already_processed=is_processed,
+                    file_size=v_size,
                 )
             )
 
@@ -194,9 +203,24 @@ def fast_scan_video_library(
                         f_str = str(f.resolve())
                         if f_str not in seen:
                             seen.add(f_str)
+                            f_size: int | None = None
+                            try:
+                                f_size = f.stat().st_size
+                            except OSError:
+                                pass
                             sidecar = Path(f"{f}.json")
-                            is_proc = sidecar.exists() and sidecar.stat().st_size > 0
-                            items.append(VideoItem(f.resolve(), sidecar_path=sidecar, already_processed=is_proc))
+                            try:
+                                is_proc = sidecar.stat().st_size > 0
+                            except OSError:
+                                is_proc = False
+                            items.append(
+                                VideoItem(
+                                    f.resolve(),
+                                    sidecar_path=sidecar,
+                                    already_processed=is_proc,
+                                    file_size=f_size,
+                                )
+                            )
                 continue
             logger.warning("Path does not exist: %s", p_str)
             continue
@@ -205,9 +229,24 @@ def fast_scan_video_library(
             p_str = str(p)
             if p.suffix.lower() in VIDEO_EXTENSIONS and p_str not in seen:
                 seen.add(p_str)
+                p_size: int | None = None
+                try:
+                    p_size = p.stat().st_size
+                except OSError:
+                    pass
                 sidecar = Path(f"{p}.json")
-                is_proc = sidecar.exists() and sidecar.stat().st_size > 0
-                items.append(VideoItem(p, sidecar_path=sidecar, already_processed=is_proc))
+                try:
+                    is_proc = sidecar.stat().st_size > 0
+                except OSError:
+                    is_proc = False
+                items.append(
+                    VideoItem(
+                        p,
+                        sidecar_path=sidecar,
+                        already_processed=is_proc,
+                        file_size=p_size,
+                    )
+                )
         elif p.is_dir():
             scan_dir(str(p))
 
@@ -363,6 +402,16 @@ def process_single_video(
 ) -> dict[str, Any]:
     """Execute inference on a single video with network retries and state updates."""
     video_path = item.path
+    if item.file_size == 0:
+        logger.warning("Skipping empty video (0 bytes): %s", video_path.name)
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "empty_file",
+            "screening_status": "skipped",
+            "detections_count": 0,
+        }
+
     if next_item is not None:
         prewarmer.prewarm(next_item.path)
 
@@ -390,6 +439,7 @@ def process_single_video(
                 early_exit=early_exit,
                 screening_ranges=ranges_to_skip,
                 is_annotation_pass=is_annotation_pass,
+                file_size=item.file_size,
             ):
                 status = chunk.get("status")
                 if status == "starting":

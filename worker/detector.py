@@ -35,6 +35,7 @@ class DaliVideoDecoder:
         step: int = 6,
         batch_size: int = 32,
         device_id: int = 0,
+        file_size: int | None = None,
     ) -> None:
         self.video_path = str(Path(video_path).resolve())
         self.step = max(int(step), 1)
@@ -43,10 +44,11 @@ class DaliVideoDecoder:
 
         # Quick file size verification before initializing C++ pipeline
         p = Path(self.video_path)
-        try:
-            file_size = p.stat().st_size
-        except OSError as err:
-            raise ValueError(f"Cannot stat video file {p.name}: {err}") from err
+        if file_size is None:
+            try:
+                file_size = p.stat().st_size
+            except OSError as err:
+                raise ValueError(f"Cannot stat video file {p.name}: {err}") from err
 
         if file_size == 0:
             raise ValueError(f"Video file is empty (0 bytes): {p.name}")
@@ -530,6 +532,7 @@ class VideoProcessor:
         early_exit: bool = False,
         screening_ranges: list[EvaluatedRange] | None = None,
         is_annotation_pass: bool = False,
+        file_size: int | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Process a video file, yielding NDJSON status dicts as processing advances."""
         target_file = Path(video_path).resolve()
@@ -544,16 +547,16 @@ class VideoProcessor:
         else:
             relative_video_name = target_file.name
 
-        if not target_file.exists():
-            yield {"error": f"File not found: {video_path}"}
-            return
-
-        try:
-            file_size = target_file.stat().st_size
-        except OSError as err:
-            logger.warning("Skipping inaccessible video %s: %s", target_file.name, err)
-            yield {"status": "skipped", "reason": "inaccessible", "path": str(target_file), "error": str(err)}
-            return
+        if file_size is None:
+            try:
+                file_size = target_file.stat().st_size
+            except FileNotFoundError:
+                yield {"error": f"File not found: {video_path}"}
+                return
+            except OSError as err:
+                logger.warning("Skipping inaccessible video %s: %s", target_file.name, err)
+                yield {"status": "skipped", "reason": "inaccessible", "path": str(target_file), "error": str(err)}
+                return
 
         if file_size == 0:
             logger.warning("Skipping empty video (0 bytes): %s", target_file.name)
@@ -583,6 +586,7 @@ class VideoProcessor:
                         step=actual_step,
                         batch_size=current_batch_size,
                         device_id=max(self.device_id, 0),
+                        file_size=file_size,
                     )
                 except ValueError as val_err:
                     logger.warning("Skipping empty or 0-sample video (%s): %s", val_err, target_file.name)

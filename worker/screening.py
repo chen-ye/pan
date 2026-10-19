@@ -120,14 +120,14 @@ class SidecarScreeningManager:
         infers screening state from detections and metadata.
         """
         p = Path(json_path)
-        if not p.exists() or p.stat().st_size == 0:
-            return None, None
-
         try:
             with open(p, encoding="utf-8") as f:
-                data = json.load(f)
+                content = f.read()
+                if not content.strip():
+                    return None, None
+                data = json.loads(content)
         except (OSError, json.JSONDecodeError) as err:
-            logger.warning("Failed to parse sidecar %s: %s", p, err)
+            logger.debug("Failed to read or parse sidecar %s: %s", p, err)
             return None, None
 
         screening_dict = data.get("info", {}).get("screening")
