@@ -162,7 +162,7 @@ Screening state is tracked non-destructively under the `info.screening` block in
 
 - **NVIDIA DALI NVDEC**: Video decoding is performed in hardware on NVIDIA GPU video decoder chips using the `nvidia.dali.fn.readers.video` operator. Frames are decoded directly into CUDA memory, bypassing CPU RAM and host-to-device PCIe bandwidth limits.
 - **Pure TorchVision Model**: Replaces external detection wrappers with direct TorchVision letterbox transformations and `torchvision.ops.nms` running in FP16 half-precision on Tensor Cores.
-- **VFS Background Pre-Warmer**: A dedicated daemon thread reads ahead on the next video in the queue, priming the rclone VFS cache chunk ring buffer so NVDEC decodes from local disk cache rather than waiting on network latency.
+- **VFS Sliding Window Lookahead Pre-Warmer**: A dedicated daemon thread maintains a sliding lookahead buffer window (default: 5 GB / 5120 MB) ahead of the active NVDEC decoder. During early-exit screening passes, it buffers only the head (default: 64 MB) of each upcoming video, pre-caching dozens of clips concurrently so DALI decodes continuously from local VFS disk cache without stalling or downloading unneeded trailers upon early exit. In full annotation passes, it prewarms entire videos up to the 5 GB buffer budget.
 - **Dynamic VRAM Batch Sizing**: Batch sizes dynamically adapt to free VRAM:
   - $\ge 15.0\text{ GB free}$: Batch size 64 (~29.8 FPS peak throughput)
   - $9.0 - 15.0\text{ GB free}$: Batch size 32
@@ -270,6 +270,8 @@ docker compose run --rm worker python /app/scripts/batch_detect.py \
 | `-f`, `--force` | `False` | Force re-evaluation of all videos, ignoring existing sidecars. |
 | `--move-blank-to` | `""` | Directory to automatically move certified blank videos and sidecars to. |
 | `--move-detected-to` | `""` | Directory to automatically move annotated videos and sidecars to. |
+| `--prewarm-buffer-mb` | `5120` | Cumulative lookahead VFS prewarm buffer size in MB (5 GB, `0` to disable). |
+| `--prewarm-head-mb` | `64` | Maximum head size (in MB) to prewarm per video during early-exit screening. |
 | `--dry-run` | `False` | Preview pass candidate counts and queues without running inference. |
 
 ---

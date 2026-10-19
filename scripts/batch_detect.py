@@ -23,6 +23,8 @@ TorchVision MegaDetector for GPU inference, with a high-throughput multi-pass BF
 screening funnel and post-screening annotation pass.
 """
 
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import logging
@@ -65,24 +67,88 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
 class VfsPrewarmer:
-    """Pre-warms upcoming videos in a background daemon thread to populate rclone VFS cache."""
+    """Pre-warms upcoming videos in a background daemon thread up to a cumulative lookahead buffer threshold.
 
-    def __init__(self) -> None:
-        self._thread: threading.Thread | None = None
+    Maintains a sliding window of prewarmed data ahead of the active decoder index:
+    - In early-exit passes (screening), prewarms only the head (e.g. 64 MB) of each upcoming video,
+      buffering multiple upcoming clips concurrently without downloading unneeded trailers.
+    - In full annotation passes, prewarms up to the cumulative buffer threshold across upcoming videos.
+    - Dynamically advances as the active decoder consumes items, maintaining the prewarm window in real time.
+    """
+
+    def __init__(
+        self,
+        buffer_size_mb: int = 5120,
+        head_size_mb: int = 64,
+        chunk_size_mb: int = 8,
+    ) -> None:
+        self.max_buffer_bytes = max(int(buffer_size_mb), 0) * 1024 * 1024
+        self.head_size_bytes = max(int(head_size_mb), 1) * 1024 * 1024
+        self.chunk_size = max(int(chunk_size_mb), 1) * 1024 * 1024
+
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
         self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
-    def prewarm(self, path: Path) -> None:
+        self._queue: list[VideoItem] = []
+        self._current_index = 0
+        self._early_exit = True
+        self._prewarmed_bytes: dict[str, int] = {}  # str(path) -> bytes read
+
+    def has_active_queue(self) -> bool:
+        with self._lock:
+            return bool(self._queue and self._thread and self._thread.is_alive())
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            if self.max_buffer_bytes <= 0:
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="vfs-prewarmer")
+            self._thread.start()
+
+    def set_queue(
+        self,
+        queue: list[VideoItem],
+        start_index: int = 0,
+        early_exit: bool = True,
+    ) -> None:
+        """Update active queue and decoding mode for a pass."""
+        with self._cv:
+            self._queue = list(queue)
+            self._current_index = start_index
+            self._early_exit = early_exit
+            active_paths = {str(it.path) for it in self._queue[start_index:]}
+            self._prewarmed_bytes = {k: v for k, v in self._prewarmed_bytes.items() if k in active_paths}
+            self._cv.notify_all()
+        self.start()
+
+    def advance(self, current_index: int) -> None:
+        """Notify prewarmer that the decoder has moved to current_index."""
+        with self._cv:
+            self._current_index = current_index
+            self._cv.notify_all()
+
+    def prewarm(self, path: Path, max_bytes: int | None = None) -> None:
+        """Fallback standalone prewarm for a single file outside of an active queue."""
         self.stop()
         self._stop_event.clear()
 
         def _worker() -> None:
+            bytes_read = 0
+            limit = max_bytes if max_bytes is not None else (self.head_size_bytes if self._early_exit else None)
             try:
                 with open(path, "rb") as f:
-                    chunk_size = 8 * 1024 * 1024  # 8MB chunk
                     while not self._stop_event.is_set():
-                        data = f.read(chunk_size)
+                        if limit is not None and bytes_read >= limit:
+                            break
+                        data = f.read(self.chunk_size)
                         if not data:
                             break
+                        bytes_read += len(data)
             except Exception as err:  # noqa: BLE001
                 logger.debug("VFS prewarmer read error on %s: %s", path, err)
 
@@ -90,9 +156,105 @@ class VfsPrewarmer:
         self._thread.start()
 
     def stop(self) -> None:
+        self._stop_event.set()
+        with self._cv:
+            self._cv.notify_all()
         if self._thread and self._thread.is_alive():
-            self._stop_event.set()
-            self._thread.join(timeout=0.2)
+            self._thread.join(timeout=0.5)
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            target_item: VideoItem | None = None
+            bytes_already_read = 0
+            max_bytes_for_file: int | None = None
+
+            with self._cv:
+                while not self._stop_event.is_set():
+                    active_ahead = self._queue[self._current_index + 1 :] if self._queue else []
+                    if not active_ahead:
+                        self._cv.wait(timeout=0.5)
+                        continue
+
+                    ahead_paths = {str(it.path) for it in active_ahead}
+                    self._prewarmed_bytes = {
+                        k: v for k, v in self._prewarmed_bytes.items() if k in ahead_paths
+                    }
+                    total_buffered = sum(max(v, 0) for v in self._prewarmed_bytes.values())
+
+                    candidate: VideoItem | None = None
+                    for it in active_ahead:
+                        if it.file_size == 0:
+                            continue
+                        p_str = str(it.path)
+                        already = self._prewarmed_bytes.get(p_str, 0)
+                        file_limit = self.head_size_bytes if self._early_exit else (it.file_size or None)
+                        if file_limit is not None and already >= file_limit:
+                            continue
+                        if already == -1:  # EOF or error
+                            continue
+
+                        if total_buffered >= self.max_buffer_bytes:
+                            break
+
+                        candidate = it
+                        bytes_already_read = max(already, 0)
+                        max_bytes_for_file = file_limit
+                        break
+
+                    if candidate is not None:
+                        target_item = candidate
+                        break
+
+                    self._cv.wait(timeout=0.5)
+
+            if self._stop_event.is_set() or target_item is None:
+                continue
+
+            p_str = str(target_item.path)
+            try:
+                with open(target_item.path, "rb") as f:
+                    if bytes_already_read > 0:
+                        f.seek(bytes_already_read)
+
+                    while not self._stop_event.is_set():
+                        with self._cv:
+                            current_ahead_paths = {
+                                str(it.path) for it in self._queue[self._current_index + 1 :]
+                            }
+                            if p_str not in current_ahead_paths:
+                                break
+                            current_buffered = sum(
+                                max(v, 0) for v in self._prewarmed_bytes.values()
+                            )
+                            if current_buffered >= self.max_buffer_bytes:
+                                break
+                            rem_buffer = self.max_buffer_bytes - current_buffered
+
+                        if max_bytes_for_file is not None:
+                            rem = max_bytes_for_file - bytes_already_read
+                            if rem <= 0:
+                                break
+                            to_read = min(self.chunk_size, rem, rem_buffer)
+                        else:
+                            to_read = min(self.chunk_size, rem_buffer)
+
+                        data = f.read(to_read)
+                        if not data:
+                            with self._cv:
+                                self._prewarmed_bytes[p_str] = -1
+                            break
+
+                        bytes_already_read += len(data)
+                        with self._cv:
+                            self._prewarmed_bytes[p_str] = bytes_already_read
+
+                        if max_bytes_for_file is not None and bytes_already_read >= max_bytes_for_file:
+                            break
+
+            except Exception as err:  # noqa: BLE001
+                logger.debug("VFS prewarmer read error on %s: %s", target_item.path, err)
+                with self._cv:
+                    self._prewarmed_bytes[p_str] = -1
 
 
 class VideoItem:
@@ -412,7 +574,7 @@ def process_single_video(
             "detections_count": 0,
         }
 
-    if next_item is not None:
+    if next_item is not None and not prewarmer.has_active_queue():
         prewarmer.prewarm(next_item.path)
 
     max_net_retries = 10
@@ -655,6 +817,18 @@ def parse_args() -> argparse.Namespace:
         help="Disable FP16 half-precision inference and force FP32.",
     )
     parser.add_argument(
+        "--prewarm-buffer-mb",
+        type=int,
+        default=5120,
+        help="Total lookahead VFS prewarm buffer size in MB (default: 5120 MB / 5 GB, 0 to disable).",
+    )
+    parser.add_argument(
+        "--prewarm-head-mb",
+        type=int,
+        default=64,
+        help="Maximum head size (in MB) to prewarm per video during early-exit screening passes.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview queues and passes without executing inference or modifying files.",
@@ -820,7 +994,10 @@ def main() -> None:
         Path(args.move_detected_to).expanduser().resolve() if args.move_detected_to else None
     )
 
-    prewarmer = VfsPrewarmer()
+    prewarmer = VfsPrewarmer(
+        buffer_size_mb=args.prewarm_buffer_mb,
+        head_size_mb=args.prewarm_head_mb,
+    )
     pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
     start_time = time.time()
 
@@ -832,19 +1009,29 @@ def main() -> None:
         pass_name: str,
         step: int | None,
         early_exit: bool,
-        is_annotation: bool,
+        is_annotation: bool = False,
+        is_annotation_pass: bool = False,
     ) -> None:
+        effective_annotation = is_annotation or is_annotation_pass
         if not queue:
             logger.info("=== %s: 0 videos in queue. Skipping. ===", pass_name)
             return
 
-        logger.info("=== %s: Processing %d video(s) (stride=%s, early_exit=%s) ===", pass_name, len(queue), step, early_exit)
+        logger.info(
+            "=== %s: Processing %d video(s) (stride=%s, early_exit=%s) ===",
+            pass_name,
+            len(queue),
+            step,
+            early_exit,
+        )
         metrics = {"processed": 0, "blank": 0, "detected": 0, "annotated": 0, "skipped": 0, "errors": 0}
 
+        prewarmer.set_queue(queue, start_index=0, early_exit=early_exit)
         pbar_vids = tqdm(queue, desc=pass_name, unit="vid")
         try:
             for i_vid, item in enumerate(pbar_vids):
                 pbar_vids.set_postfix_str(item.path.name[:25])
+                prewarmer.advance(i_vid)
                 next_item = queue[i_vid + 1] if i_vid + 1 < len(queue) else None
 
                 res = process_single_video(
@@ -852,7 +1039,7 @@ def main() -> None:
                     item=item,
                     step=step,
                     early_exit=early_exit,
-                    is_annotation_pass=is_annotation,
+                    is_annotation_pass=effective_annotation,
                     base_dir=base_dir,
                     batch_size=args.batch_size,
                     conf=args.conf,
