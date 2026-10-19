@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,15 +16,6 @@ from nvidia.dali import fn, pipeline_def
 from torchvision import ops
 
 logger = logging.getLogger(__name__)
-
-CLASS_MAPPING: dict[Any, str] = {
-    1: "animal",
-    2: "person",
-    3: "vehicle",
-    "1": "animal",
-    "2": "person",
-    "3": "vehicle",
-}
 
 
 class DaliVideoDecoder:
@@ -104,6 +96,21 @@ class DaliVideoDecoder:
 
         return frames, fnums, timestamps
 
+    def close(self) -> None:
+        """Release DALI pipeline and terminate background C++ prefetch worker threads."""
+        pipe = getattr(self, "pipe", None)
+        if pipe is not None:
+            self.pipe = None
+            try:
+                if hasattr(pipe, "_shutdown"):
+                    pipe._shutdown()
+                del pipe
+            except Exception as err:  # noqa: BLE001
+                logger.debug("DALI pipeline cleanup error: %s", err)
+
+    def __del__(self) -> None:
+        self.close()
+
 
 class TorchVisionMegaDetector:
     """Torchvision-based MegaDetector implementation operating directly on GPU tensors.
@@ -121,6 +128,7 @@ class TorchVisionMegaDetector:
         default_image_size: int = 1280,
         iou_threshold: float = 0.45,
         max_det: int = 300,
+        fp16: bool = True,
     ) -> None:
         self.model_version = model_version
         if device is None:
@@ -130,27 +138,46 @@ class TorchVisionMegaDetector:
         else:
             self.device = device
 
+        self.fp16 = bool(fp16 and self.device.type == "cuda")
         force_cpu = self.device.type == "cpu"
         logger.info(
-            "Loading MegaDetector model '%s' (device: %s)...",
+            "Loading MegaDetector model '%s' (device: %s, fp16: %s)...",
             self.model_version,
             self.device,
+            self.fp16,
         )
         base_detector = run_detector.load_detector(self.model_version, force_cpu=force_cpu)
 
         # Extract underlying YOLOv5 DetectionModel
         self.model = base_detector.model.to(self.device).eval()
+        if self.fp16:
+            self.model = self.model.half()
+
         self.default_image_size = getattr(base_detector, "default_image_size", default_image_size)
         self.letterbox_stride = getattr(base_detector, "letterbox_stride", 64)
         self.iou_threshold = iou_threshold
         self.max_det = max_det
+        self.categories = self._init_categories()
 
         logger.info(
-            "TorchVisionMegaDetector ready: device=%s, image_size=%d, stride=%d",
+            "TorchVisionMegaDetector ready: device=%s, fp16=%s, image_size=%d, stride=%d, categories=%s",
             self.device,
+            self.fp16,
             self.default_image_size,
             self.letterbox_stride,
+            self.categories,
         )
+
+    def _init_categories(self) -> dict[str, str]:
+        """Dynamically extract category mapping from model weights with standard fallback."""
+        names = getattr(self.model, "names", None)
+        if isinstance(names, dict):
+            min_k = min(names.keys()) if names else 0
+            offset = 1 if min_k == 0 else 0
+            return {str(k + offset): str(v) for k, v in names.items()}
+        if isinstance(names, (list, tuple)):
+            return {str(i + 1): str(v) for i, v in enumerate(names)}
+        return {"1": "animal", "2": "person", "3": "vehicle"}
 
     def preprocess(
         self,
@@ -228,8 +255,9 @@ class TorchVisionMegaDetector:
         # Pad with standard YOLO background gray (fill=114)
         x_padded = TF.pad(x_resized, [left, top, right, bottom], fill=114)
 
-        # Normalize uint8 to float32 [0.0, 1.0]
-        x_norm = x_padded.to(dtype=torch.float32) / 255.0
+        # Normalize uint8 to float16 (if fp16) or float32 [0.0, 1.0]
+        target_dtype = torch.float16 if self.fp16 else torch.float32
+        x_norm = x_padded.to(dtype=target_dtype) / 255.0
 
         return x_norm, scale, (left, top), (orig_h, orig_w)
 
@@ -243,6 +271,8 @@ class TorchVisionMegaDetector:
         detection_threshold: float = 0.00001,
     ) -> list[dict[str, Any]]:
         """Postprocess raw model predictions using torchvision batched NMS."""
+        if preds.dtype == torch.float16:
+            preds = preds.float()
         left, top = pad
         orig_h, orig_w = orig_shape
         batch_size = preds.shape[0]
@@ -357,7 +387,7 @@ def extract_detections_from_batch(
     conf_threshold: float,
     timestamps: list[float] | None = None,
 ) -> list[dict[str, Any]]:
-    """Parse raw MegaDetector batch detections into Pan schema."""
+    """Parse raw MegaDetector batch detections into MegaDetector schema."""
     extracted: list[dict[str, Any]] = []
     for i_res, res in enumerate(batch_results):
         frame_num = int(res["file"])
@@ -366,16 +396,14 @@ def extract_detections_from_batch(
             for d in res["detections"]:
                 conf = float(d["conf"])
                 if conf > conf_threshold:
-                    cat_id = d["category"]
-                    class_name = CLASS_MAPPING.get(cat_id, f"unknown_{cat_id}")
+                    cat_id = str(d["category"])
                     x, y, w, h = d["bbox"]
-                    bbox = [float(x), float(y), float(x + w), float(y + h)]
                     extracted.append({
-                        "frame": frame_num,
-                        "timestamp": round(ts, 3),
-                        "category": class_name,
+                        "category": cat_id,
                         "conf": round(conf, 4),
-                        "bbox": [round(coord, 5) for coord in bbox],
+                        "bbox": [round(float(c), 5) for c in (x, y, w, h)],
+                        "frame_number": frame_num,
+                        "timestamp": round(ts, 3),
                     })
     return extracted
 
@@ -392,125 +420,267 @@ def save_atomic_json(json_path: Path, data: dict[str, Any]) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+def resolve_batch_size(
+    requested: int | str | None = "auto",
+    device: str | torch.device = "cuda:0",
+) -> int:
+    """Dynamically resolve optimal batch size based on real-time available GPU VRAM.
+
+    Heuristic based on empirical RTX 3090 benchmarks:
+    - free VRAM >= 16.0 GB: 64 (optimal throughput sweet spot; ~29.8 FPS)
+    - 10.0 <= free VRAM < 16.0 GB: 32 (standard safe; ~28.2 FPS, ~7.5 GB allocation)
+    - 6.0 <= free VRAM < 10.0 GB: 16 (moderate headroom; ~3.5 GB allocation)
+    - free VRAM < 6.0 GB: 8 (low memory fallback)
+    """
+    if requested is not None and not (isinstance(requested, str) and requested.lower() == "auto"):
+        try:
+            val = int(requested)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+
+    dev = torch.device(device) if isinstance(device, str) else device
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return 4
+
+    try:
+        dev_idx = dev.index if dev.index is not None else 0
+        free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
+        reserved_bytes = torch.cuda.memory_reserved(dev_idx)
+        allocated_bytes = torch.cuda.memory_allocated(dev_idx)
+        reusable_bytes = max(reserved_bytes - allocated_bytes, 0)
+        effective_free_bytes = free_bytes + reusable_bytes
+        free_gb = effective_free_bytes / (1024**3)
+
+        if free_gb >= 15.0:
+            return 64
+        if free_gb >= 9.0:
+            return 32
+        if free_gb >= 5.0:
+            return 16
+        return 8
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Failed to query CUDA memory info: %s; falling back to batch size 64", err)
+        return 64
+
+
 class VideoProcessor:
     """Encapsulates NVIDIA DALI NVDEC frame decoding and Torchvision MegaDetector inference."""
 
     def __init__(
         self,
         model_version: str = "MDv1000-redwood",
-        device: str | None = None,
+        device: str | torch.device | None = None,
+        fp16: bool = True,
+        batch_size: int | str = "auto",
     ) -> None:
         self.model_version = model_version
-        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.device_id = 0 if self.device.startswith("cuda") else -1
+        if device is None:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+        self.device_id = (self.device.index or 0) if self.device.type == "cuda" else -1
+        self.fp16 = fp16
+        self.default_batch_size = batch_size
         self.detector = TorchVisionMegaDetector(
             model_version=self.model_version,
             device=self.device,
+            fp16=self.fp16,
         )
 
     def process_video_stream(
         self,
         video_path: str | Path,
         rel_path: str | None = None,
-        batch_size: int = 32,
+        base_dir: str | Path | None = None,
+        batch_size: int | str | None = None,
         conf_threshold: float = 0.2,
         frame_fps: float = 4.0,
         target_size: int = 1280,
     ) -> Iterator[dict[str, Any]]:
         """Process a video file, yielding NDJSON status dicts as processing advances."""
         target_file = Path(video_path).resolve()
-        relative_video_name = rel_path or target_file.name
+        if rel_path:
+            relative_video_name = rel_path
+        elif base_dir:
+            base_path = Path(base_dir).resolve()
+            if base_path in target_file.parents:
+                relative_video_name = str(target_file.relative_to(base_path))
+            else:
+                relative_video_name = target_file.name
+        else:
+            relative_video_name = target_file.name
 
         if not target_file.exists():
             yield {"error": f"File not found: {video_path}"}
             return
 
-        logger.info("Starting DALI NVDEC processing for %s...", target_file)
-        yield {"status": "starting", "path": str(target_file)}
+        current_batch_size = resolve_batch_size(
+            batch_size if batch_size is not None else self.default_batch_size,
+            self.device,
+        )
 
-        # Approximate nominal step for frame_fps (assume ~12-24 fps nominal; step=3 gives 4 fps from 12fps)
+        logger.info(
+            "Starting DALI NVDEC processing for %s (batch_size=%d)...",
+            target_file,
+            current_batch_size,
+        )
+
         step = max(int(12.0 / frame_fps), 1)
+        max_oom_retries = 2
 
-        try:
-            decoder = DaliVideoDecoder(
-                target_file,
-                step=step,
-                batch_size=batch_size,
-                device_id=max(self.device_id, 0),
-            )
-        except Exception as err:  # noqa: BLE001
-            logger.error("Failed to open DALI video decoder for %s: %s", target_file, err)
-            yield {"error": f"Failed to open DALI video decoder: {err}"}
-            return
+        for attempt in range(max_oom_retries + 1):
+            decoder = None
+            try:
+                try:
+                    decoder = DaliVideoDecoder(
+                        target_file,
+                        step=step,
+                        batch_size=current_batch_size,
+                        device_id=max(self.device_id, 0),
+                    )
+                except Exception as err:  # noqa: BLE001
+                    logger.error("Failed to open DALI video decoder for %s: %s", target_file, err)
+                    yield {"error": f"Failed to open DALI video decoder: {err}"}
+                    return
 
-        total_sample_frames = decoder.total_samples
-        if total_sample_frames == 0:
-            yield {"error": f"Video contains 0 decodeable samples: {target_file}"}
-            return
+                total_sample_frames = decoder.total_samples
+                if total_sample_frames == 0:
+                    yield {"error": f"Video contains 0 decodeable samples: {target_file}"}
+                    return
 
-        results_list: list[dict[str, Any]] = []
-        width = 0
-        height = 0
-        last_frame_num = 0
-        last_timestamp = 0.0
+                yield {
+                    "status": "starting",
+                    "path": str(target_file),
+                    "total_samples": total_sample_frames,
+                    "total_frames": total_sample_frames * step,
+                    "batch_size": current_batch_size,
+                }
 
-        for frames, fnums, timestamps in decoder:
-            if width == 0:
-                height = frames.shape[1]
-                width = frames.shape[2]
+                results_list: list[dict[str, Any]] = []
+                width = 0
+                height = 0
+                last_frame_num = 0
+                last_timestamp = 0.0
+                oom_occurred = False
 
-            batch_results = self.detector.generate_detections_one_batch(
-                frames,
-                image_ids=fnums,
-                detection_threshold=conf_threshold,
-            )
-            detections = extract_detections_from_batch(
-                batch_results,
-                conf_threshold=conf_threshold,
-                timestamps=timestamps,
-            )
-            results_list.extend(detections)
+                try:
+                    for frames, fnums, timestamps in decoder:
+                        if width == 0:
+                            height = frames.shape[1]
+                            width = frames.shape[2]
 
-            last_frame_num = fnums[-1]
-            last_timestamp = timestamps[-1]
+                        batch_results = self.detector.generate_detections_one_batch(
+                            frames,
+                            image_ids=fnums,
+                            detection_threshold=conf_threshold,
+                        )
+                        detections = extract_detections_from_batch(
+                            batch_results,
+                            conf_threshold=conf_threshold,
+                            timestamps=timestamps,
+                        )
+                        results_list.extend(detections)
 
-            progress = min(decoder.samples_read / max(total_sample_frames, 1), 1.0)
-            yield {
-                "status": "progress",
-                "progress": round(progress, 3),
-                "frame": last_frame_num,
-                "total_frames": total_sample_frames * step,
-            }
+                        last_frame_num = fnums[-1]
+                        last_timestamp = timestamps[-1]
 
-        fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
-        json_path = Path(f"{target_file}.json")
-        is_partial = decoder.is_partial or (0 < decoder.samples_read < total_sample_frames)
-        output_data = {
-            "video": relative_video_name,
-            "metadata": {
-                "fps": fps,
-                "total_frames": last_frame_num + 1,
-                "width": width,
-                "height": height,
-                "partial": is_partial,
-            },
-            "partial": is_partial,
-            "detections": results_list,
-        }
-        if is_partial and decoder.partial_reason:
-            output_data["metadata"]["partial_reason"] = decoder.partial_reason
-            output_data["partial_reason"] = decoder.partial_reason
+                        progress = min(decoder.samples_read / max(total_sample_frames, 1), 1.0)
+                        yield {
+                            "status": "progress",
+                            "progress": round(progress, 3),
+                            "frame": last_frame_num,
+                            "batch_samples": len(fnums),
+                            "total_frames": total_sample_frames * step,
+                        }
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+                    err_str = str(err)
+                    if (
+                        ("out of memory" in err_str.lower() or "cuda out of memory" in err_str.lower())
+                        and attempt < max_oom_retries
+                        and current_batch_size > 8
+                    ):
+                        oom_occurred = True
+                        torch.cuda.empty_cache()
+                        new_batch = max(current_batch_size // 2, 8)
+                        logger.warning(
+                            "CUDA OOM on %s at batch_size=%d. Reducing batch_size to %d and retrying (attempt %d/%d)...",
+                            target_file.name,
+                            current_batch_size,
+                            new_batch,
+                            attempt + 1,
+                            max_oom_retries,
+                        )
+                        current_batch_size = new_batch
+                        break
+                    logger.error("Error during inference on %s: %s", target_file, err)
+                    yield {"error": f"Error during inference: {err}"}
+                    return
 
-        try:
-            save_atomic_json(json_path, output_data)
-            logger.info("Saved results to %s (%d detections, partial=%s).", json_path, len(results_list), is_partial)
-            yield {
-                "status": "complete",
-                "output": str(json_path),
-                "detections_count": len(results_list),
-                "partial": is_partial,
-                "detections": results_list,
-            }
-        except Exception as err:  # noqa: BLE001
-            logger.error("Failed to save JSON sidecar %s: %s", json_path, err)
-            yield {"error": f"Failed to save results: {err}"}
+                if oom_occurred:
+                    continue
+
+                fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
+                json_path = Path(f"{target_file}.json")
+                is_partial = decoder.is_partial or (0 < decoder.samples_read < total_sample_frames)
+                image_entry: dict[str, Any] = {
+                    "file": relative_video_name,
+                    "frame_rate": fps,
+                    "total_frames": last_frame_num + 1,
+                    "width": width,
+                    "height": height,
+                    "detections": results_list,
+                }
+                if is_partial:
+                    image_entry["partial"] = True
+                    if decoder.partial_reason:
+                        image_entry["partial_reason"] = decoder.partial_reason
+
+                output_data = {
+                    "info": {
+                        "format_version": "1.6",
+                        "detector": self.model_version,
+                        "detection_completion_time": datetime.now(UTC).isoformat(),
+                        "detector_metadata": {
+                            "image_size": target_size,
+                            "typical_detection_threshold": conf_threshold,
+                            "precision": "fp16" if getattr(self.detector, "fp16", False) else "fp32",
+                            "batch_size": current_batch_size,
+                        },
+                    },
+                    "detection_categories": getattr(
+                        self.detector,
+                        "categories",
+                        {"1": "animal", "2": "person", "3": "vehicle"},
+                    ),
+                    "images": [image_entry],
+                }
+
+                try:
+                    save_atomic_json(json_path, output_data)
+                    logger.info(
+                        "Saved results to %s (%d detections, partial=%s, batch_size=%d).",
+                        json_path,
+                        len(results_list),
+                        is_partial,
+                        current_batch_size,
+                    )
+                    yield {
+                        "status": "complete",
+                        "output": str(json_path),
+                        "detections_count": len(results_list),
+                        "partial": is_partial,
+                        "result_data": output_data,
+                        "detections": results_list,
+                        "batch_size": current_batch_size,
+                    }
+                except Exception as err:  # noqa: BLE001
+                    logger.error("Failed to save JSON sidecar %s: %s", json_path, err)
+                    yield {"error": f"Failed to save results: {err}"}
+                break
+            finally:
+                if decoder is not None:
+                    decoder.close()

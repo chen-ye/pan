@@ -36,9 +36,9 @@ if os.path.isdir(BREW_LIB):
         os.execve(sys.executable, [sys.executable, *sys.argv], new_env)
 
 import argparse
-import json
 import logging
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ import torch
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "worker"))
-from detector import DaliVideoDecoder, TorchVisionMegaDetector
+from detector import VideoProcessor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,14 +58,36 @@ logger = logging.getLogger("pan-batch-detect")
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-CLASS_MAPPING: dict[Any, str] = {
-    1: "animal",
-    2: "person",
-    3: "vehicle",
-    "1": "animal",
-    "2": "person",
-    "3": "vehicle",
-}
+
+class VfsPrewarmer:
+    """Pre-warms upcoming videos in a background daemon thread to populate rclone VFS cache."""
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def prewarm(self, path: Path) -> None:
+        self.stop()
+        self._stop_event.clear()
+
+        def _worker() -> None:
+            try:
+                with open(path, "rb") as f:
+                    chunk_size = 8 * 1024 * 1024  # 8MB chunk
+                    while not self._stop_event.is_set():
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+            except Exception as err:  # noqa: BLE001
+                logger.debug("VFS prewarmer read error on %s: %s", path, err)
+
+        self._thread = threading.Thread(target=_worker, daemon=True, name="vfs-prewarmer")
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread and self._thread.is_alive():
+            self._stop_event.set()
+            self._thread.join(timeout=0.2)
 
 
 class VideoItem:
@@ -207,124 +229,6 @@ def move_file_and_sidecars(
     return target_video
 
 
-def extract_detections_from_model_batch(
-    batch_results: list[dict[str, Any]],
-    conf_threshold: float,
-    timestamps: list[float] | None = None,
-) -> list[dict[str, Any]]:
-    """Parse raw MegaDetector batch detections into Pan's schema."""
-    extracted: list[dict[str, Any]] = []
-    for i_res, res in enumerate(batch_results):
-        frame_num = int(res["file"])
-        ts = timestamps[i_res] if timestamps and i_res < len(timestamps) else 0.0
-        if res.get("detections"):
-            for d in res["detections"]:
-                conf = float(d["conf"])
-                if conf > conf_threshold:
-                    cat_id = d["category"]
-                    class_name = CLASS_MAPPING.get(cat_id, f"unknown_{cat_id}")
-                    x, y, w, h = d["bbox"]
-                    bbox = [float(x), float(y), float(x + w), float(y + h)]
-                    extracted.append({
-                        "frame": frame_num,
-                        "timestamp": round(ts, 3),
-                        "category": class_name,
-                        "conf": round(conf, 4),
-                        "bbox": [round(coord, 5) for coord in bbox],
-                    })
-    return extracted
-
-
-def process_video_with_dali(
-    video_path: Path,
-    model: TorchVisionMegaDetector,
-    base_dir: Path | None,
-    batch_size: int = 32,
-    conf_threshold: float = 0.2,
-    target_size: int = 1280,
-    frame_fps: float = 4.0,
-    pbar_frames: tqdm | None = None,
-) -> tuple[dict[str, Any], int]:
-    """Process video using NVIDIA DALI NVDEC as the sole decoder and GPU MegaDetector for inference."""
-    step = max(int(12.0 / frame_fps), 1)
-    decoder = DaliVideoDecoder(video_path, step=step, batch_size=batch_size, device_id=0)
-
-    if decoder.total_samples == 0:
-        raise ValueError(f"Unable to read video frames with DALI: {video_path}")
-
-    if pbar_frames is not None:
-        pbar_frames.reset(total=decoder.total_samples)
-        pbar_frames.set_description(f"Frames [DALI NVDEC]: {video_path.name[:25]}")
-
-    results_list: list[dict[str, Any]] = []
-    width = 0
-    height = 0
-    last_frame_num = 0
-    last_timestamp = 0.0
-
-    for frames, fnums, timestamps in decoder:
-        if width == 0:
-            height = frames.shape[1]
-            width = frames.shape[2]
-
-        batch_results = model.generate_detections_one_batch(
-            frames,
-            image_ids=fnums,
-            detection_threshold=conf_threshold,
-        )
-        detections = extract_detections_from_model_batch(
-            batch_results,
-            conf_threshold=conf_threshold,
-            timestamps=timestamps,
-        )
-        results_list.extend(detections)
-
-        last_frame_num = fnums[-1]
-        last_timestamp = timestamps[-1]
-
-        if pbar_frames is not None:
-            pbar_frames.update(len(fnums))
-
-    if base_dir and base_dir in video_path.parents:
-        rel_path = str(video_path.relative_to(base_dir))
-    else:
-        rel_path = video_path.name
-
-    fps = round(last_frame_num / last_timestamp, 2) if last_timestamp > 0 else 12.0
-    is_partial = decoder.is_partial or (0 < decoder.samples_read < decoder.total_samples)
-    result_data = {
-        "video": rel_path,
-        "metadata": {
-            "fps": fps,
-            "total_frames": last_frame_num + 1,
-            "width": width,
-            "height": height,
-            "partial": is_partial,
-        },
-        "partial": is_partial,
-        "detections": results_list,
-    }
-    if is_partial and decoder.partial_reason:
-        result_data["metadata"]["partial_reason"] = decoder.partial_reason
-        result_data["partial_reason"] = decoder.partial_reason
-
-    return result_data, len(results_list)
-
-
-def save_detection_json(video_path: Path, data: dict[str, Any]) -> Path:
-    """Save the detection result atomically as <video_path>.json."""
-    json_path = Path(f"{video_path}.json")
-    tmp_path = Path(f"{video_path}.json.tmp.{os.getpid()}")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        tmp_path.replace(json_path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-    return json_path
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch MegaDetector video processor matching Pan NVR format (using NVIDIA DALI NVDEC).",
@@ -365,9 +269,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-size",
-        type=int,
-        default=32,
-        help="Inference frame batch size.",
+        type=lambda v: v if str(v).lower() == "auto" else int(v),
+        default="auto",
+        help="Inference frame batch size (integer or 'auto' for dynamic VRAM sizing).",
     )
     parser.add_argument(
         "--conf",
@@ -418,6 +322,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional destination directory to move videos and sidecars with >=1 detection.",
     )
     parser.add_argument(
+        "--no-fp16",
+        dest="fp16",
+        action="store_false",
+        default=True,
+        help="Disable FP16 half-precision inference and force FP32.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview files to process and actions to take without running inference or moving files.",
@@ -431,17 +342,20 @@ def main() -> None:
 
     input_paths = list(args.paths) + list(args.inputs)
     if not input_paths:
-        default_dir = Path("/mnt/y/NVR/NVR-unprocessed")
-        if default_dir.exists():
-            logger.info("No paths specified; defaulting to %s", default_dir)
-            input_paths = [str(default_dir)]
-        else:
+        for candidate in [Path("/data/NVR-unprocessed"), Path("/mnt/y/NVR/NVR-unprocessed")]:
+            if candidate.exists():
+                logger.info("No paths specified; defaulting to %s", candidate)
+                input_paths = [str(candidate)]
+                break
+        if not input_paths:
             logger.error("No input files or directories specified. See --help.")
             sys.exit(1)
 
     base_dir: Path | None = None
     if args.base_dir:
         base_dir = Path(args.base_dir).expanduser().resolve()
+    elif Path("/data").exists():
+        base_dir = Path("/data").resolve()
     elif Path("/mnt/y/NVR").exists():
         base_dir = Path("/mnt/y/NVR").resolve()
 
@@ -509,19 +423,24 @@ def main() -> None:
         logger.info("CUDA not available. Using CPU.")
 
     logger.info("Decoder backend: NVIDIA DALI (hardware NVDEC)")
-    logger.info("Inference engine: TorchVisionMegaDetector (pure GPU tensor pipeline)")
+    use_fp16 = bool(args.fp16 and target_device.type == "cuda")
+    logger.info(
+        "Inference engine: TorchVisionMegaDetector (pure GPU tensor pipeline, fp16=%s)",
+        use_fp16,
+    )
 
-    logger.info("Loading MegaDetector model '%s'...", args.model)
+    logger.info("Initializing VideoProcessor with model '%s' (batch_size=%s)...", args.model, args.batch_size)
     start_load = time.time()
     try:
-        model = TorchVisionMegaDetector(
+        processor = VideoProcessor(
             model_version=args.model,
             device=target_device,
-            default_image_size=args.target_size,
+            fp16=use_fp16,
+            batch_size=args.batch_size,
         )
-        logger.info("Model loaded successfully in %.2fs.", time.time() - start_load)
+        logger.info("VideoProcessor ready in %.2fs.", time.time() - start_load)
     except Exception as e:  # noqa: BLE001
-        logger.error("Failed to load MegaDetector model: %s", e)
+        logger.error("Failed to initialize VideoProcessor: %s", e)
         sys.exit(1)
 
     move_blank_dir = Path(args.move_blank_to).expanduser().resolve() if args.move_blank_to else None
@@ -539,28 +458,62 @@ def main() -> None:
 
     pbar_videos = tqdm(videos_to_process, desc="Videos", unit="vid")
     pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
+    prewarmer = VfsPrewarmer()
 
     try:
-        for video_path in pbar_videos:
+        for i_vid, video_path in enumerate(pbar_videos):
             pbar_videos.set_postfix_str(video_path.name[:25])
+            # Pre-warm the next video in background to populate rclone VFS cache
+            if i_vid + 1 < len(videos_to_process):
+                prewarmer.prewarm(videos_to_process[i_vid + 1])
+
             max_net_retries = 10
             net_retry_count = 0
             while True:
                 try:
-                    data, det_count = process_video_with_dali(
+                    det_count = 0
+                    result_data: dict[str, Any] = {}
+                    is_error = False
+                    err_msg = ""
+
+                    for chunk in processor.process_video_stream(
                         video_path=video_path,
-                        model=model,
                         base_dir=base_dir,
                         batch_size=args.batch_size,
                         conf_threshold=args.conf,
                         target_size=args.target_size,
                         frame_fps=args.frame_fps,
-                        pbar_frames=pbar_frames,
-                    )
-                    save_detection_json(video_path, data)
+                    ):
+                        status = chunk.get("status")
+                        if status == "starting":
+                            total_samples = chunk.get("total_samples", 0)
+                            active_b = chunk.get("batch_size", args.batch_size)
+                            pbar_frames.reset(total=total_samples)
+                            pbar_frames.set_description(f"Frames [DALI b={active_b}]: {video_path.name[:20]}")
+                        elif status == "progress":
+                            pbar_frames.update(chunk.get("batch_samples", 0))
+                        elif status == "complete":
+                            det_count = chunk.get("detections_count", 0)
+                            result_data = chunk.get("result_data", {})
+                            active_b = chunk.get("batch_size", args.batch_size)
+                            logger.info(
+                                "Finished %s: %d detections (batch=%s)",
+                                video_path.name,
+                                det_count,
+                                active_b,
+                            )
+                            sys.stdout.flush()
+                            sys.stderr.flush()
+                        elif "error" in chunk:
+                            is_error = True
+                            err_msg = chunk["error"]
+
+                    if is_error:
+                        raise RuntimeError(err_msg)
+
                     processed_count += 1
                     total_detections += det_count
-                    if data.get("partial"):
+                    if result_data.get("images", [{}])[0].get("partial"):
                         partial_count += 1
 
                     if det_count == 0:
@@ -605,6 +558,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.warning("\nProcessing interrupted by user (Ctrl+C). Exiting...")
     finally:
+        prewarmer.stop()
         pbar_frames.close()
         pbar_videos.close()
 

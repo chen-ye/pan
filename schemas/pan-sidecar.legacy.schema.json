@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cye/pan/schemas/pan-sidecar.legacy.schema.json",
+  "title": "PanLegacySidecar",
+  "description": "Legacy per-video sidecar JSON format used by Pan before MegaDetector ecosystem standardization.",
+  "type": "object",
+  "required": ["video"],
+  "properties": {
+    "video": {
+      "type": "string",
+      "description": "Relative or base path to the video file."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Video stream and processing metadata.",
+      "properties": {
+        "fps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Video frame rate in frames per second."
+        },
+        "total_frames": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total frames in the video stream."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Native frame width in pixels."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Native frame height in pixels."
+        },
+        "partial": {
+          "type": "boolean",
+          "description": "Indicates whether video decoding terminated early due to corrupt boundary packets."
+        },
+        "partial_reason": {
+          "type": "string",
+          "description": "Reason for partial decoding (e.g. corrupt_trailing_packet)."
+        }
+      },
+      "additionalProperties": true
+    },
+    "partial": {
+      "type": "boolean",
+      "description": "Root-level mirror of partial status."
+    },
+    "partial_reason": {
+      "type": "string",
+      "description": "Root-level mirror of partial decoding reason."
+    },
+    "detections": {
+      "type": "array",
+      "description": "List of object detections across all sampled frames.",
+      "items": {
+        "type": "object",
+        "required": ["category", "conf", "bbox"],
+        "properties": {
+          "frame": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based source video frame index."
+          },
+          "timestamp": {
+            "type": "number",
+            "minimum": 0.0,
+            "description": "Presentation timestamp in seconds."
+          },
+          "category": {
+            "type": "string",
+            "description": "Detection category name (e.g. 'animal', 'person', 'vehicle')."
+          },
+          "conf": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Detection confidence score between 0.0 and 1.0."
+          },
+          "bbox": {
+            "type": "array",
+            "description": "Normalized bounding box in corner coordinates: [x_min, y_min, x_max, y_max].",
+            "items": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            },
+            "minItems": 4,
+            "maxItems": 4
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "annotations": {
+      "type": "array",
+      "description": "Legacy pre-2025 annotation grouping format.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "img_id": {
+            "type": "string"
+          },
+          "bbox": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 4,
+              "maxItems": 4
+            }
+          },
+          "category": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "confidence": {
+            "type": "array",
+            "items": { "type": "number" }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

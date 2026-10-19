@@ -155,3 +155,6 @@ venv/
 playwright-report/
 test-results/
 
+# OS metadata
+._*
+.DS_Store

@@ -34,9 +34,12 @@ services:
   worker:
     build: ./worker
     volumes:
+      - .:/app
       - nvr_data:/data
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
     environment:
       - DATA_DIR=/data
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
     ports:
       - "5000:5000"
     deploy:

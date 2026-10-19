@@ -28,10 +28,11 @@ app = Flask(__name__)
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "MDv1000-redwood")
+DEFAULT_BATCH_SIZE = os.environ.get("PAN_BATCH_SIZE", "auto")
 
 processor: VideoProcessor | None = None
 try:
-    processor = VideoProcessor(model_version=MODEL_VERSION)
+    processor = VideoProcessor(model_version=MODEL_VERSION, batch_size=DEFAULT_BATCH_SIZE)
 except Exception as e:  # noqa: BLE001
     logger.error("Failed to initialize VideoProcessor: %s", e)
 
@@ -46,10 +47,15 @@ def handle_process() -> tuple[Response, int] | Response:
     if not rel_path:
         return jsonify({"error": "No path provided"}), 400
 
+    batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
     video_path = Path(DATA_DIR) / rel_path
 
     def generate():
-        for chunk in processor.process_video_stream(video_path, rel_path=rel_path):
+        for chunk in processor.process_video_stream(
+            video_path,
+            rel_path=rel_path,
+            batch_size=batch_size,
+        ):
             yield json.dumps(chunk) + "\n"
             sys.stdout.flush()
 
@@ -66,7 +72,9 @@ def status() -> Response:
         "status": "ready" if processor is not None else "error",
         "device": device,
         "model": MODEL_VERSION,
-        "engine": "torchcodec",
+        "engine": "dali_nvdec",
+        "precision": "fp16" if getattr(processor, "fp16", False) else "fp32",
+        "batch_size_policy": DEFAULT_BATCH_SIZE,
     })
 
 

@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cye/pan/schemas/pan-sidecar.megadetector.schema.json",
+  "title": "MegaDetectorCompatibleSidecar",
+  "description": "Standard MegaDetector v1.6-compliant per-video sidecar JSON schema with the 'images' subkey.",
+  "type": "object",
+  "required": ["info", "detection_categories", "images"],
+  "properties": {
+    "info": {
+      "type": "object",
+      "required": ["format_version"],
+      "description": "Metadata about the detector model and schema version.",
+      "properties": {
+        "format_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$",
+          "description": "MegaDetector output format version (e.g. '1.6')."
+        },
+        "detector": {
+          "type": "string",
+          "description": "Model identifier (e.g. 'MDv1000-redwood', 'md_v5a.0.0.pt')."
+        },
+        "detection_completion_time": {
+          "type": "string",
+          "description": "Timestamp when detection completed."
+        },
+        "detector_metadata": {
+          "type": "object",
+          "description": "Model inference parameters and threshold recommendations.",
+          "properties": {
+            "image_size": { "type": "integer" },
+            "typical_detection_threshold": { "type": "number" },
+            "conservative_detection_threshold": { "type": "number" },
+            "precision": {
+              "type": "string",
+              "enum": ["fp16", "fp32"],
+              "description": "Floating-point precision used during model inference ('fp16' or 'fp32')."
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "detection_categories": {
+      "type": "object",
+      "description": "Dictionary mapping string category IDs to category names.",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "classification_categories": {
+      "type": "object",
+      "description": "Optional dictionary mapping species category IDs to taxon names.",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "images": {
+      "type": "array",
+      "description": "List of media files. For single-video sidecars, this contains exactly one video entry.",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["file", "detections"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Relative path to the media file."
+          },
+          "frame_rate": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Playback frame rate of the video in FPS."
+          },
+          "frames_processed": {
+            "type": "array",
+            "description": "List of sampled frame numbers evaluated by the detector.",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "total_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total frames in the video stream."
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Source video pixel width."
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Source video pixel height."
+          },
+          "partial": {
+            "type": "boolean",
+            "description": "Flag indicating if decoding was truncated early due to corrupt boundary packets."
+          },
+          "partial_reason": {
+            "type": "string",
+            "description": "Reason for partial completion."
+          },
+          "failure": {
+            "type": ["string", "null"],
+            "description": "Error string if processing completely failed, or null if successful."
+          },
+          "detections": {
+            "type": "array",
+            "description": "List of detected objects across video frames.",
+            "items": {
+              "type": "object",
+              "required": ["category", "conf", "bbox"],
+              "properties": {
+                "category": {
+                  "type": "string",
+                  "pattern": "^[0-9]+$",
+                  "description": "String integer ID matching a key in detection_categories."
+                },
+                "conf": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0,
+                  "description": "Detection confidence."
+                },
+                "bbox": {
+                  "type": "array",
+                  "description": "Normalized bounding box in MegaDetector format: [x_min, y_min, width_of_box, height_of_box].",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                  },
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "frame_number": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Zero-based source frame number in the video."
+                },
+                "timestamp": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "description": "Playback timestamp in seconds."
+                },
+                "classifications": {
+                  "type": "array",
+                  "description": "Optional species classification tuples [[species_id, confidence], ...].",
+                  "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

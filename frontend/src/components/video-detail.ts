@@ -229,12 +229,12 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     );
 
     currentDetections.forEach((d) => {
-      const [x1, y1, x2, y2] = d.bbox; // normalized
+      const [x, y, w, h] = d.bbox; // MegaDetector [x, y, w, h] normalized
 
-      const rx = x1 * canvas.width;
-      const ry = y1 * canvas.height;
-      const rw = (x2 - x1) * canvas.width;
-      const rh = (y2 - y1) * canvas.height;
+      const rx = x * canvas.width;
+      const ry = y * canvas.height;
+      const rw = w * canvas.width;
+      const rh = h * canvas.height;
 
       // Draw Box
       ctx.strokeStyle = "#f00";
@@ -580,27 +580,29 @@ export class VideoDetail extends SignalWatcher(LitElement) {
                 });
 
                 // Calculate crop
-                const [x1, y1, x2, y2] = det.bbox;
+                const [x, y, w, h] = det.bbox;
                 const vw = tempVideo.videoWidth;
                 const vh = tempVideo.videoHeight;
 
                 // Check for absolute vs normalized coordinates
                 // If coordinates are > 1.1, assume they are absolute pixels
-                const isAbsolute = x1 > 1.1 || y1 > 1.1 || x2 > 1.1 || y2 > 1.1;
+                const isAbsolute = x > 1.1 || y > 1.1 || w > 1.1 || h > 1.1;
 
-                let sx, sy, sw, sh;
+                let sx: number;
+                let sy: number;
+                let sw: number;
+                let sh: number;
 
                 if (isAbsolute) {
-                    // console.warn(`Detected absolute coordinates for frame ${det.frame}:`, det.bbox);
-                    sx = x1;
-                    sy = y1;
-                    sw = x2 - x1;
-                    sh = y2 - y1;
+                    sx = x;
+                    sy = y;
+                    sw = w;
+                    sh = h;
                 } else {
-                    sx = x1 * vw;
-                    sy = y1 * vh;
-                    sw = (x2 - x1) * vw;
-                    sh = (y2 - y1) * vh;
+                    sx = x * vw;
+                    sy = y * vh;
+                    sw = w * vw;
+                    sh = h * vh;
                 }
 
                 // Integer pixels
