@@ -698,10 +698,8 @@ def process_single_video(
                     err_str,
                 )
                 logger.warning("Recycling process via os.execve to restore clean CUDA context and resume pipeline...")
-                prewarmer.stop()
                 sys.stdout.flush()
                 sys.stderr.flush()
-                time.sleep(2.0)
                 os.execve(sys.executable, [sys.executable, *sys.argv], os.environ.copy())
 
             logger.error("Error processing %s: %s", video_path, e)
