@@ -401,6 +401,16 @@ def process_single_video(
                     pbar_frames.update(chunk.get("batch_samples", 0))
                 elif status == "early_exit":
                     is_early_exit = True
+                elif status == "skipped":
+                    reason = chunk.get("reason", "empty")
+                    logger.warning("Skipped %s (%s)", video_path.name, reason)
+                    return {
+                        "success": True,
+                        "skipped": True,
+                        "reason": reason,
+                        "screening_status": "skipped",
+                        "detections_count": 0,
+                    }
                 elif status == "complete":
                     det_count = chunk.get("detections_count", 0)
                     result_data = chunk.get("result_data", {})
@@ -779,7 +789,7 @@ def main() -> None:
             return
 
         logger.info("=== %s: Processing %d video(s) (stride=%s, early_exit=%s) ===", pass_name, len(queue), step, early_exit)
-        metrics = {"processed": 0, "blank": 0, "detected": 0, "annotated": 0, "errors": 0}
+        metrics = {"processed": 0, "blank": 0, "detected": 0, "annotated": 0, "skipped": 0, "errors": 0}
 
         pbar_vids = tqdm(queue, desc=pass_name, unit="vid")
         try:
@@ -802,7 +812,9 @@ def main() -> None:
                     next_item=next_item,
                 )
 
-                if res.get("success"):
+                if res.get("skipped"):
+                    metrics["skipped"] += 1
+                elif res.get("success"):
                     metrics["processed"] += 1
                     status = res.get("screening_status", "")
                     if status == "blank":
@@ -904,12 +916,13 @@ def main() -> None:
     logger.info("Total videos discovered: %d", len(discovered_items))
     for p_name, metrics in pass_metrics.items():
         logger.info(
-            "  %s: %d processed | %d blank, %d detected, %d annotated, %d errors",
+            "  %s: %d processed | %d blank, %d detected, %d annotated, %d skipped, %d errors",
             p_name,
             metrics["processed"],
             metrics["blank"],
             metrics["detected"],
             metrics["annotated"],
+            metrics.get("skipped", 0),
             metrics["errors"],
         )
     logger.info("=" * 60)

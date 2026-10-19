@@ -41,6 +41,16 @@ class DaliVideoDecoder:
         self.batch_size = batch_size
         self.device_id = device_id
 
+        # Quick file size verification before initializing C++ pipeline
+        p = Path(self.video_path)
+        try:
+            file_size = p.stat().st_size
+        except OSError as err:
+            raise ValueError(f"Cannot stat video file {p.name}: {err}") from err
+
+        if file_size == 0:
+            raise ValueError(f"Video file is empty (0 bytes): {p.name}")
+
         # Define DALI graph using modern experimental video reader with NVDEC
         @pipeline_def(batch_size=self.batch_size, num_threads=4, device_id=self.device_id)
         def video_pipe():
@@ -55,11 +65,19 @@ class DaliVideoDecoder:
             return outputs[0], outputs[1], outputs[2]
 
         self.pipe = video_pipe()
-        self.pipe.build()
+        try:
+            self.pipe.build()
+        except RuntimeError as err:
+            err_str = str(err)
+            if "The number of input samples: 0" in err_str or "num_shards_ <= Size()" in err_str:
+                raise ValueError(f"Video contains 0 decodeable samples: {p.name}") from None
+            raise
 
         epoch_dict = self.pipe.epoch_size()
         self.total_samples = next(iter(epoch_dict.values())) if epoch_dict else 0
-        self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size if self.total_samples > 0 else 0
+        if self.total_samples == 0:
+            raise ValueError(f"Video contains 0 decodeable samples: {p.name}")
+        self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size
         self._samples_read = 0
         self.is_partial = False
         self.partial_reason: str | None = None
@@ -530,6 +548,18 @@ class VideoProcessor:
             yield {"error": f"File not found: {video_path}"}
             return
 
+        try:
+            file_size = target_file.stat().st_size
+        except OSError as err:
+            logger.warning("Skipping inaccessible video %s: %s", target_file.name, err)
+            yield {"status": "skipped", "reason": "inaccessible", "path": str(target_file), "error": str(err)}
+            return
+
+        if file_size == 0:
+            logger.warning("Skipping empty video (0 bytes): %s", target_file.name)
+            yield {"status": "skipped", "reason": "empty_file", "path": str(target_file)}
+            return
+
         current_batch_size = resolve_batch_size(
             batch_size if batch_size is not None else self.default_batch_size,
             self.device,
@@ -554,14 +584,24 @@ class VideoProcessor:
                         batch_size=current_batch_size,
                         device_id=max(self.device_id, 0),
                     )
+                except ValueError as val_err:
+                    logger.warning("Skipping empty or 0-sample video (%s): %s", val_err, target_file.name)
+                    yield {
+                        "status": "skipped",
+                        "reason": "empty_or_invalid",
+                        "path": str(target_file),
+                        "error": str(val_err),
+                    }
+                    return
                 except Exception as err:  # noqa: BLE001
-                    logger.error("Failed to open DALI video decoder for %s: %s", target_file, err)
+                    logger.error("Failed to open DALI video decoder for %s: %s", target_file.name, err)
                     yield {"error": f"Failed to open DALI video decoder: {err}"}
                     return
 
                 total_sample_frames = decoder.total_samples
                 if total_sample_frames == 0:
-                    yield {"error": f"Video contains 0 decodeable samples: {target_file}"}
+                    logger.warning("Skipping video with 0 decodeable samples: %s", target_file.name)
+                    yield {"status": "skipped", "reason": "zero_samples", "path": str(target_file)}
                     return
 
                 yield {
