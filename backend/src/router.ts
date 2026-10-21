@@ -6,7 +6,7 @@ import { metadataService } from "./services/metadata.ts";
 import { sseService } from "./services/sse.ts";
 import { processingService } from "./services/processing.ts";
 import { getDirTree } from "./services/files.ts";
-import { normalizeLegacyFormat } from "./utils.ts";
+import { DEFAULT_DETECTION_CATEGORIES, normalizeLegacyFormat } from "./utils.ts";
 import { m3u8Service } from "./services/m3u8.ts";
 
 export const router = new Router();
@@ -77,8 +77,12 @@ router.post("/api/videos/search", async (ctx) => {
               if (lowerT === "blank" && vState === "blank") { match = true; break; }
               if (lowerT === "detected" && vState === "detected") { match = true; break; }
               if (lowerT === "annotated" && vState === "annotated") { match = true; break; }
-              if (lowerT === "upload" && v.classifications?.includes("Upload")) { match = true; break; }
-              if (v.classifications?.some((c: string) => c.toLowerCase() === lowerT)) { match = true; break; }
+              if (lowerT === "upload" && v.classifications?.some((c: unknown) => String(c).toLowerCase() === "upload")) { match = true; break; }
+              if (v.classifications?.some((c: unknown) => {
+                const s = String(c);
+                const catName = DEFAULT_DETECTION_CATEGORIES[s] || s;
+                return catName.toLowerCase() === lowerT;
+              })) { match = true; break; }
           }
       }
 
@@ -108,7 +112,10 @@ router.post("/api/videos/search", async (ctx) => {
       state: v.state || (v.processed ? (v.classifications?.length ? "annotated" : "blank") : "unprocessed"),
       stride: v.stride,
       size: v.size,
-      classifications: v.classifications || [],
+      classifications: (v.classifications || []).map((c: unknown) => {
+        const s = String(c);
+        return DEFAULT_DETECTION_CATEGORIES[s] || s;
+      }),
       duration: v.duration
     };
   });

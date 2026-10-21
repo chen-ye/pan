@@ -1,7 +1,7 @@
 import { ensureDir, walk } from "@std/fs";
 import { dirname, extname, join, relative } from "@std/path";
 import { CONFIG } from "../config.ts";
-import { normalizeLegacyFormat, Detection } from "../utils.ts";
+import { normalizeLegacyFormat, Detection, DEFAULT_DETECTION_CATEGORIES } from "../utils.ts";
 import { sseService } from "./sse.ts";
 
 export type VideoState = "unprocessed" | "candidate" | "blank" | "detected" | "annotated";
@@ -143,7 +143,11 @@ export class LibraryService {
               if (data.detections && data.detections.length > 0) {
                   const cats = new Set<string>();
                   data.detections.forEach((d: Detection) => {
-                      if (d.category) cats.add(d.category);
+                      if (d.category) {
+                          const catStr = String(d.category);
+                          const resolvedCategory = DEFAULT_DETECTION_CATEGORIES[catStr] || catStr;
+                          cats.add(resolvedCategory);
+                      }
                   });
                   classifications = Array.from(cats).sort();
               }
@@ -211,7 +215,15 @@ export class LibraryService {
           const cachePath = join(CONFIG.DATA_DIR, CACHE_FILE);
           const text = await Deno.readTextFile(cachePath);
           const data = JSON.parse(text) as VideoEntry[];
-          this.cache = new Map(data.map(v => [v.path, v]));
+          this.cache = new Map(data.map(v => {
+              if (Array.isArray(v.classifications)) {
+                  v.classifications = v.classifications.map((c: unknown) => {
+                      const str = String(c);
+                      return DEFAULT_DETECTION_CATEGORIES[str] || str;
+                  });
+              }
+              return [v.path, v];
+          }));
           console.log(`Cache loaded. ${this.cache.size} entries.`);
       } catch {
           console.log("No existing cache file found or failed to load.");

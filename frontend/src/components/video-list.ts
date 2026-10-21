@@ -17,6 +17,19 @@ function formatDuration(seconds?: number) {
   return (h > 0 ? `${h}h ` : "") + `${m}m ${s}s`;
 }
 
+const CATEGORY_MAP: Record<string, string> = {
+  "1": "animal",
+  "2": "person",
+  "3": "vehicle",
+};
+
+export function formatClassification(category: unknown): string {
+  if (category === null || category === undefined) return "unknown";
+  if (Array.isArray(category)) return String(category[0] ?? "unknown");
+  const str = String(category);
+  return CATEGORY_MAP[str] || str;
+}
+
 export function formatSize(bytes: number) {
   if (bytes === 0) return "0 B";
   const k = 1024;
@@ -347,9 +360,14 @@ export class VideoList extends SignalWatcher(LitElement) {
                 })()}
                 ${v.state === "candidate" && v.stride ? html`<span class="tag info-stride">Stride ${v.stride}</span>` : ""}
                 ${(v.state === "detected" || v.state === "annotated") && v.classifications
-                  ? v.classifications.filter(c => c !== "Upload").map(c => html`<span class="tag processed category-${c.toLowerCase()}">${c}</span>`)
+                  ? v.classifications
+                      .map(formatClassification)
+                      .filter(categoryName => categoryName.toLowerCase() !== "upload")
+                      .map(categoryName => html`<span class="tag processed category-${categoryName.toLowerCase()}">${categoryName}</span>`)
                   : ""}
-                ${v.classifications?.includes("Upload") ? html`<span class="tag upload-tag">Upload</span>` : ""}
+                ${v.classifications?.some(category => formatClassification(category).toLowerCase() === "upload")
+                  ? html`<span class="tag upload-tag">Upload</span>`
+                  : ""}
                 ${isProcessing ? html`<span class="tag progress">${Math.round((job?.progress || 0) * 100)}%</span>` : ""}
                 <span class="tag">${formatSize(v.size)}</span>
                 ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ""}
