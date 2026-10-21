@@ -33,6 +33,7 @@ services:
 
   worker:
     build: ./worker
+    working_dir: /app/worker
     volumes:
       - .:/app
       - nvr_data:/data
@@ -50,6 +51,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    restart: unless-stopped
 
   thumbnail:
     build: ./thumbnail
