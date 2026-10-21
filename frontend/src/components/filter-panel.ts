@@ -68,7 +68,7 @@ export class FilterPanel extends SignalWatcher(LitElement) {
       <sl-divider></sl-divider>
       <div class="section-title">Status/Classifications</div>
 
-      ${['Unprocessed', 'Upload', 'Blank', 'Animal', 'Person', 'Vehicle'].map(tag => html`
+      ${['Unprocessed', 'Candidate', 'Blank', 'Detected', 'Annotated', 'Upload', 'Animal', 'Person', 'Vehicle'].map(tag => html`
         <sl-checkbox
             .checked="${this.state.selectedTags.get().has(tag)}"
             @sl-change="${() => this.state.toggleTag(tag)}"

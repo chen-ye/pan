@@ -4,6 +4,8 @@ import { CONFIG } from "../config.ts";
 import { normalizeLegacyFormat, Detection } from "../utils.ts";
 import { sseService } from "./sse.ts";
 
+export type VideoState = "unprocessed" | "candidate" | "blank" | "detected" | "annotated";
+
 export interface VideoEntry {
   path: string;
   name: string;
@@ -11,8 +13,9 @@ export interface VideoEntry {
   size: number;
   mtime: number;
   duration?: number;
-  duration?: number;
   processed?: boolean;
+  state?: VideoState;
+  stride?: number;
   classifications?: string[];
 }
 
@@ -21,7 +24,7 @@ const CACHE_FILE = ".pan_library_cache.json";
 export class LibraryService {
   private library: VideoEntry[] = [];
   private cache: Map<string, VideoEntry> = new Map();
-  private saveTimeout: number | undefined;
+  private saveTimeout: ReturnType<typeof setTimeout> | undefined;
 
   constructor() {
     // Initial refresh
@@ -67,10 +70,12 @@ export class LibraryService {
              const info = await Deno.stat(entry.path);
              const mtime = info.mtime?.getTime() || 0;
 
-             if (cached && cached.mtime === mtime && cached.processed !== undefined) {
+             if (cached && cached.mtime === mtime && cached.processed !== undefined && cached.state !== undefined) {
                  // Reuse cache
                  metadata = {
                      processed: cached.processed,
+                     state: cached.state,
+                     stride: cached.stride,
                      classifications: cached.classifications
                  };
              }
@@ -104,12 +109,16 @@ export class LibraryService {
   }
 
   async enrichEntry(entry: VideoEntry) {
-      if (entry.processed !== undefined) return; // Already enriched
+      if (entry.processed !== undefined && entry.state !== undefined) return; // Already enriched
 
       const jsonPath = entry.fullPath + ".json";
       const legacyJsonPath = entry.fullPath.substring(0, entry.fullPath.lastIndexOf(".")) + ".json";
 
       let processed = false;
+      let state: VideoState = "unprocessed";
+      let stride: number | undefined = undefined;
+      let classifications: string[] = [];
+
       try {
          const jInfo = await Deno.stat(jsonPath);
          processed = jInfo.size > 0;
@@ -120,31 +129,65 @@ export class LibraryService {
           } catch { }
       }
 
-      let classifications: string[] = [];
       if (processed) {
           try {
+              let text = "";
               try {
-                 const text = await Deno.readTextFile(jsonPath);
-                 let data = JSON.parse(text);
-                 data = normalizeLegacyFormat(data);
-                 if (data.detections) {
-                     const cats = new Set<string>();
-                     data.detections.forEach((d: Detection) => cats.add(d.category));
-                     classifications = Array.from(cats).sort();
-                 }
+                 text = await Deno.readTextFile(jsonPath);
               } catch {
-                  try {
-                     const text = await Deno.readTextFile(legacyJsonPath);
-                     let data = JSON.parse(text);
-                     data = normalizeLegacyFormat(data);
-                     if (data.detections) {
-                         const cats = new Set<string>();
-                         data.detections.forEach((d: Detection) => cats.add(d.category));
-                         classifications = Array.from(cats).sort();
-                     }
-                  } catch { }
+                 text = await Deno.readTextFile(legacyJsonPath);
               }
-          } catch { }
+              // deno-lint-ignore no-explicit-any
+              const rawData: any = JSON.parse(text);
+              const data = normalizeLegacyFormat(rawData);
+              if (data.detections && data.detections.length > 0) {
+                  const cats = new Set<string>();
+                  data.detections.forEach((d: Detection) => {
+                      if (d.category) cats.add(d.category);
+                  });
+                  classifications = Array.from(cats).sort();
+              }
+
+              // Determine state & stride from rawData / screening info
+              const screening = rawData.info?.screening;
+              const img = rawData.images && rawData.images[0] ? rawData.images[0] : {};
+              const isPartial = Boolean(img.partial || screening?.early_exit);
+              const hasDetections = classifications.length > 0;
+
+              if (hasDetections) {
+                  state = isPartial ? "detected" : "annotated";
+              } else {
+                  if (screening) {
+                      const completed: number[] = Array.isArray(screening.strides_completed)
+                          ? screening.strides_completed
+                          : [];
+                      const minStride = completed.length > 0
+                          ? Math.min(...completed)
+                          : (screening.max_stride_evaluated || 24);
+
+                      if (minStride <= 1) {
+                          state = "blank";
+                          stride = 1;
+                      } else {
+                          state = "candidate";
+                          stride = minStride;
+                      }
+                  } else {
+                      if (isPartial) {
+                          state = "candidate";
+                          stride = 4;
+                      } else {
+                          state = "blank";
+                          stride = 1;
+                      }
+                  }
+              }
+          } catch {
+              processed = false;
+              state = "unprocessed";
+          }
+      } else {
+          state = "unprocessed";
       }
 
       // Add 'Upload' tag if in upload directory
@@ -154,6 +197,8 @@ export class LibraryService {
       }
 
       entry.processed = processed;
+      entry.state = state;
+      entry.stride = stride;
       entry.classifications = classifications;
 
       // Update cache map and trigger save

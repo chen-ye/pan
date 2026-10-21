@@ -2,7 +2,7 @@ import { CONFIG } from "../config.ts";
 import { sseService } from "./sse.ts";
 
 class StatsService {
-  private pollInterval: number | null = null;
+  private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   start() {
     // Poll worker stats every 5 seconds and broadcast via SSE

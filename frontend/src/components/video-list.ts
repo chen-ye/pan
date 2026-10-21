@@ -112,10 +112,59 @@ export class VideoList extends SignalWatcher(LitElement) {
       font-size: 0.7rem;
       background: var(--sl-color-neutral-200);
       color: var(--sl-color-neutral-700);
+      font-weight: 500;
+    }
+    .tag.state-unprocessed {
+      background: var(--sl-color-neutral-200);
+      color: var(--sl-color-neutral-700);
+    }
+    .tag.state-candidate {
+      background: #e0e7ff;
+      color: #3730a3;
+      font-weight: 600;
+    }
+    .tag.info-stride {
+      background: #eef2ff;
+      color: #4338ca;
+      border: 1px solid #c7d2fe;
+    }
+    .tag.state-blank {
+      background: var(--sl-color-neutral-200);
+      color: var(--sl-color-neutral-600);
+    }
+    .tag.state-detected {
+      background: #fef3c7;
+      color: #92400e;
+      font-weight: 600;
+    }
+    .tag.state-annotated {
+      background: var(--sl-color-success-100);
+      color: var(--sl-color-success-800);
+      font-weight: 600;
     }
     .tag.processed {
-      background: var(--sl-color-success-100);
-      color: var(--sl-color-success-700);
+      background: #f0fdf4;
+      color: #15803d;
+      border: 1px solid #bbf7d0;
+    }
+    .tag.category-animal {
+      background: #fce7f3;
+      color: #9d174d;
+      border: 1px solid #fbcfe8;
+    }
+    .tag.category-person {
+      background: #e0f2fe;
+      color: #0369a1;
+      border: 1px solid #bae6fd;
+    }
+    .tag.category-vehicle {
+      background: #fee2e2;
+      color: #b91c1c;
+      border: 1px solid #fecaca;
+    }
+    .tag.upload-tag {
+      background: #ffedd5;
+      color: #9a3412;
     }
     .tag.progress {
       background: var(--sl-color-primary-100);
@@ -280,9 +329,27 @@ export class VideoList extends SignalWatcher(LitElement) {
                  @click="${() => this.state.selectVideo(v.path)}">
               <div class="video-title" title="${v.name}">${v.name}</div>
               <div class="tag-container">
-                ${!v.processed ? html`<span class="tag">Unprocessed</span>` : ""}
-                ${v.processed && (!v.classifications || v.classifications.length === 0) ? html`<span class="tag">Blank</span>` : ""}
-                ${v.processed && v.classifications ? v.classifications.map(c => html`<span class="tag processed">${c}</span>`) : ""}
+                ${(() => {
+                  const state = v.state || (v.processed ? (v.classifications?.length ? "annotated" : "blank") : "unprocessed");
+                  switch (state) {
+                    case "candidate":
+                      return html`<span class="tag state-candidate">Candidate</span>`;
+                    case "detected":
+                      return html`<span class="tag state-detected">Detected</span>`;
+                    case "annotated":
+                      return html`<span class="tag state-annotated">Annotated</span>`;
+                    case "blank":
+                      return html`<span class="tag state-blank">Blank</span>`;
+                    case "unprocessed":
+                    default:
+                      return html`<span class="tag state-unprocessed">Unprocessed</span>`;
+                  }
+                })()}
+                ${v.state === "candidate" && v.stride ? html`<span class="tag info-stride">Stride ${v.stride}</span>` : ""}
+                ${(v.state === "detected" || v.state === "annotated") && v.classifications
+                  ? v.classifications.filter(c => c !== "Upload").map(c => html`<span class="tag processed category-${c.toLowerCase()}">${c}</span>`)
+                  : ""}
+                ${v.classifications?.includes("Upload") ? html`<span class="tag upload-tag">Upload</span>` : ""}
                 ${isProcessing ? html`<span class="tag progress">${Math.round((job?.progress || 0) * 100)}%</span>` : ""}
                 <span class="tag">${formatSize(v.size)}</span>
                 ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ""}

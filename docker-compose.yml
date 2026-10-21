@@ -50,6 +50,25 @@ services:
               count: 1
               capabilities: [gpu]
 
+  thumbnail:
+    build: ./services/thumbnail
+    volumes:
+      - nvr_data:/data:ro
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+    environment:
+      - DATA_DIR=/data
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
   test:
     profiles:
       - test
@@ -60,6 +79,7 @@ services:
     depends_on:
       - app
       - frontend
+      - thumbnail
     ipc: host
     command: sh -c "npm install && tail -f /dev/null"
 
@@ -75,6 +95,7 @@ services:
     depends_on:
       - app
       - frontend
+      - thumbnail
     restart: unless-stopped
 
 volumes:

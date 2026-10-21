@@ -68,11 +68,17 @@ router.post("/api/videos/search", async (ctx) => {
       let match = true;
       if (tags.length > 0) {
           match = false;
-          if (tags.includes("Unprocessed") && !v.processed) match = true;
-          else if (tags.includes("Blank") && v.processed && (!v.classifications || v.classifications.length === 0)) match = true;
-          else if (v.processed && v.classifications && v.classifications.length > 0) {
-              // deno-lint-ignore no-explicit-any
-              if (tags.some((t: any) => v.classifications?.includes(t))) match = true;
+          const vState = v.state || (v.processed ? (v.classifications?.length ? "annotated" : "blank") : "unprocessed");
+
+          for (const t of tags) {
+              const lowerT = String(t).toLowerCase();
+              if (lowerT === "unprocessed" && vState === "unprocessed") { match = true; break; }
+              if (lowerT === "candidate" && vState === "candidate") { match = true; break; }
+              if (lowerT === "blank" && vState === "blank") { match = true; break; }
+              if (lowerT === "detected" && vState === "detected") { match = true; break; }
+              if (lowerT === "annotated" && vState === "annotated") { match = true; break; }
+              if (lowerT === "upload" && v.classifications?.includes("Upload")) { match = true; break; }
+              if (v.classifications?.some((c: string) => c.toLowerCase() === lowerT)) { match = true; break; }
           }
       }
 
@@ -99,6 +105,8 @@ router.post("/api/videos/search", async (ctx) => {
       path: v.path,
       name: v.name,
       processed: v.processed || false,
+      state: v.state || (v.processed ? (v.classifications?.length ? "annotated" : "blank") : "unprocessed"),
+      stride: v.stride,
       size: v.size,
       classifications: v.classifications || [],
       duration: v.duration

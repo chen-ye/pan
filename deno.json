@@ -1,0 +1,11 @@
+{
+  "nodeModulesDir": "auto",
+  "workspace": [
+    "./backend",
+    "./frontend"
+  ],
+  "tasks": {
+    "check": "deno check backend/main.ts backend/tests/*.ts frontend/src/main.ts",
+    "test": "deno test -A --config backend/deno.json backend/tests/"
+  }
+}

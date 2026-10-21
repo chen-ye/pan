@@ -286,3 +286,54 @@ class SidecarScreeningManager:
         temp_file.replace(target_json)
 
         return output_data
+
+    @staticmethod
+    def save_skipped_sidecar(
+        json_path: str | Path,
+        relative_video_name: str,
+        reason: str = "empty_or_invalid",
+    ) -> dict[str, Any]:
+        """Save a minimal sidecar for skipped/corrupt/empty video files to avoid repeated processing."""
+        target_json = Path(json_path).resolve()
+        output_data: dict[str, Any] = {
+            "info": {
+                "format_version": "1.6",
+                "detection_completion_time": datetime.now(UTC).isoformat(),
+                "screening": {
+                    "version": "1.0",
+                    "status": "skipped",
+                    "reason": reason,
+                    "strides_completed": [],
+                    "max_stride_evaluated": 24,
+                    "early_exit": False,
+                    "early_exit_frame": None,
+                    "evaluated_ranges": [],
+                },
+            },
+            "detection_categories": {
+                "1": "animal",
+                "2": "person",
+                "3": "vehicle",
+            },
+            "images": [
+                {
+                    "file": relative_video_name,
+                    "frame_rate": 0.0,
+                    "total_frames": 0,
+                    "width": 0,
+                    "height": 0,
+                    "detections": [],
+                    "partial": False,
+                    "skipped": True,
+                    "skip_reason": reason,
+                }
+            ],
+        }
+
+        temp_file = target_json.with_suffix(f"{target_json.suffix}.tmp.{datetime.now().timestamp()}")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, indent=2)
+        temp_file.replace(target_json)
+
+        return output_data
+

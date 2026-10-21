@@ -55,6 +55,26 @@ class TestEmptyVideoHandling(unittest.TestCase):
         self.assertIsNone(data)
         self.assertIsNone(state)
 
+    def test_save_and_load_skipped_sidecar(self):
+        """save_skipped_sidecar should create valid JSON and load back with status='skipped'."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "worker"))
+        from screening import SidecarScreeningManager
+
+        skip_json = Path(self.temp_dir.name) / "skipped.mp4.json"
+        SidecarScreeningManager.save_skipped_sidecar(
+            json_path=skip_json,
+            relative_video_name="skipped.mp4",
+            reason="empty_or_invalid",
+        )
+        self.assertTrue(skip_json.is_file())
+        data, state = SidecarScreeningManager.load_sidecar(skip_json)
+        self.assertIsNotNone(data)
+        self.assertIsNotNone(state)
+        self.assertEqual(state.status, "skipped")
+        self.assertEqual(data["images"][0]["skipped"], True)
+        self.assertEqual(data["images"][0]["skip_reason"], "empty_or_invalid")
+
 
 if __name__ == "__main__":
     unittest.main()
+

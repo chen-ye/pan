@@ -4,10 +4,14 @@ export interface TreeNode {
   children: TreeNode[];
 }
 
+export type VideoState = "unprocessed" | "candidate" | "blank" | "detected" | "annotated";
+
 export interface Video {
   path: string;
   name: string;
   processed: boolean;
+  state?: VideoState;
+  stride?: number;
   size: number;
   duration?: number;
   classifications?: string[];
@@ -47,6 +51,15 @@ export interface Result {
       typical_detection_threshold?: number;
       conservative_detection_threshold?: number;
       precision?: "fp16" | "fp32" | string;
+      [key: string]: unknown;
+    };
+    screening?: {
+      version?: string;
+      status?: "blank" | "detected" | "annotated" | "skipped";
+      strides_completed?: number[];
+      max_stride_evaluated?: number;
+      early_exit?: boolean;
+      early_exit_frame?: number | null;
       [key: string]: unknown;
     };
   };

@@ -96,6 +96,19 @@ class TestQueuePartitioning(unittest.TestCase):
             ),
         )
 
+        # 7. Skipped video (empty/corrupt file)
+        self.skipped = VideoItem(
+            path=Path("/data/test/skipped.mp4"),
+            already_processed=True,
+            screening_state=ScreeningState(
+                status="skipped",
+                strides_completed=[],
+                max_stride_evaluated=24,
+                early_exit=False,
+                evaluated_ranges=[],
+            ),
+        )
+
         self.all_items = [
             self.unprocessed,
             self.p1_blank,
@@ -103,7 +116,9 @@ class TestQueuePartitioning(unittest.TestCase):
             self.certified_blank,
             self.p1_detected,
             self.annotated,
+            self.skipped,
         ]
+
 
     def test_has_completed_stride_or_finer(self):
         self.assertFalse(has_completed_stride_or_finer(None, 24))

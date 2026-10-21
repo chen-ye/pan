@@ -26,7 +26,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_CORRUPTED_PIPELINES: list[Any] = []
 
 
 class DaliVideoDecoder:
@@ -102,16 +101,19 @@ class DaliVideoDecoder:
             out = self.pipe.run()
         except RuntimeError as e:
             err_str = str(e)
-            if ("av_bsf_receive_packet" in err_str or "Critical error in pipeline" in err_str) and self._samples_read > 0:
-                self.is_partial = True
-                self.partial_reason = "corrupt_trailing_packet"
-                logger.warning(
-                    "Corrupt EOF/trailing packet encountered on %s after %d/%d frames; stopping gracefully (partial=True).",
-                    self.video_path,
-                    self._samples_read,
-                    self.total_samples,
-                )
-                raise StopIteration from None
+            if "av_bsf_receive_packet" in err_str or "Critical error in pipeline" in err_str:
+                if self._samples_read > 0:
+                    self.is_partial = True
+                    self.partial_reason = "corrupt_trailing_packet"
+                    logger.warning(
+                        "Corrupt EOF/trailing packet encountered on %s after %d/%d frames; stopping gracefully (partial=True).",
+                        self.video_path,
+                        self._samples_read,
+                        self.total_samples,
+                    )
+                    raise StopIteration from None
+                p_name = Path(self.video_path).name
+                raise ValueError(f"Corrupt video bitstream on initial decode: {p_name}") from None
             raise
 
         raw_frames = torch.from_dlpack(out[0].as_tensor()).squeeze(1)  # shape: (B, H, W, 3) uint8 in VRAM
@@ -127,22 +129,11 @@ class DaliVideoDecoder:
 
         return frames, fnums, timestamps
 
-    def mark_corrupted(self) -> None:
-        """Flag that CUDA context or pipeline is in an unrecoverable error state."""
-        self._is_corrupted = True
-
     def close(self) -> None:
         """Release DALI pipeline and terminate background C++ prefetch worker threads."""
         pipe = getattr(self, "pipe", None)
         if pipe is not None:
             self.pipe = None
-            if getattr(self, "_is_corrupted", False):
-                # When CUDA context or DALI pipeline is corrupted, calling _shutdown()
-                # or invoking ~Pipeline() destructor causes DALI to throw dali::CUDAError
-                # inside a C++ destructor, which triggers std::terminate() and aborts the process.
-                # Retaining a reference prevents destructor execution during error recovery.
-                _CORRUPTED_PIPELINES.append(pipe)
-                return
             try:
                 if hasattr(pipe, "_shutdown"):
                     pipe._shutdown()
@@ -152,6 +143,7 @@ class DaliVideoDecoder:
 
     def __del__(self) -> None:
         self.close()
+
 
 
 class TorchVisionMegaDetector:
@@ -507,16 +499,15 @@ def resolve_batch_size(
         effective_free_bytes = free_bytes + reusable_bytes
         free_gb = effective_free_bytes / (1024**3)
 
-        if free_gb >= 15.0:
-            return 64
-        if free_gb >= 9.0:
+        if free_gb >= 8.0:
             return 32
-        if free_gb >= 5.0:
+        if free_gb >= 4.0:
             return 16
         return 8
     except Exception as err:  # noqa: BLE001
-        logger.debug("Failed to query CUDA memory info: %s; falling back to batch size 64", err)
-        return 64
+        logger.debug("Failed to query CUDA memory info: %s; falling back to batch size 32", err)
+        return 32
+
 
 
 class VideoProcessor:
@@ -720,8 +711,21 @@ class VideoProcessor:
                                 "frame": early_exit_frame,
                                 "detections_count": len(results_list),
                             }
-                            break
+                except ValueError as val_err:
+                    logger.warning(
+                        "Skipping corrupt or un-decodable video during decode (%s): %s",
+                        val_err,
+                        target_file.name,
+                    )
+                    yield {
+                        "status": "skipped",
+                        "reason": "empty_or_invalid",
+                        "path": str(target_file),
+                        "error": str(val_err),
+                    }
+                    return
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+
                     err_str = str(err)
                     if (
                         ("out of memory" in err_str.lower() or "cuda out of memory" in err_str.lower())
@@ -742,10 +746,9 @@ class VideoProcessor:
                         current_batch_size = new_batch
                         break
                     logger.error("Error during inference on %s: %s", target_file, err)
-                    if decoder is not None and ("cuda" in err_str.lower() or "dali" in err_str.lower()):
-                        decoder.mark_corrupted()
                     yield {"error": f"Error during inference: {err}"}
                     return
+
 
                 if oom_occurred:
                     continue
@@ -801,16 +804,21 @@ class VideoProcessor:
                     yield {"error": f"Failed to save results: {err}"}
                 break
             finally:
+                cuda_is_poisoned = False
                 if torch.cuda.is_available():
                     try:
                         torch.cuda.synchronize()
                     except RuntimeError as err:
+                        err_str = str(err).lower()
+                        if "cudaerrorunknown" in err_str or "cuda error: unknown error" in err_str or "999" in err_str:
+                            cuda_is_poisoned = True
                         logger.debug("CUDA synchronize error: %s", err)
-                if decoder is not None:
+                if decoder is not None and not cuda_is_poisoned:
                     decoder.close()
-                if torch.cuda.is_available():
+                if torch.cuda.is_available() and not cuda_is_poisoned:
                     try:
                         torch.cuda.empty_cache()
                     except RuntimeError as err:
                         logger.debug("CUDA empty_cache error: %s", err)
                 gc.collect()
+

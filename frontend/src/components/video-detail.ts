@@ -441,13 +441,27 @@ export class VideoDetail extends SignalWatcher(LitElement) {
         : ""}
 
       <div class="info-panel">
-        ${isProcessed
-          ? html`
-            <div style="margin-bottom: var(--sl-spacing-medium);">
-              <sl-tag type="success">Processed</sl-tag>
-            </div>
-          `
-          : ""}
+        <div style="margin-bottom: var(--sl-spacing-medium); display: flex; gap: 6px; flex-wrap: wrap;">
+          ${(() => {
+            const state = vidData?.state || (isProcessed ? (vidData?.classifications?.length ? "annotated" : "blank") : "unprocessed");
+            switch (state) {
+              case "candidate":
+                return html`
+                  <sl-tag variant="primary">Candidate</sl-tag>
+                  ${vidData?.stride ? html`<sl-tag variant="neutral">Stride ${vidData.stride}</sl-tag>` : ""}
+                `;
+              case "detected":
+                return html`<sl-tag variant="warning">Detected</sl-tag>`;
+              case "annotated":
+                return html`<sl-tag variant="success">Annotated</sl-tag>`;
+              case "blank":
+                return html`<sl-tag variant="neutral">Blank</sl-tag>`;
+              case "unprocessed":
+              default:
+                return html`<sl-tag variant="neutral">Unprocessed</sl-tag>`;
+            }
+          })()}
+        </div>
         <h3>Metadata</h3>
         <p><strong>File:</strong> ${currentPath}</p>
         ${vidData?.duration
@@ -461,13 +475,36 @@ export class VideoDetail extends SignalWatcher(LitElement) {
             <p><strong>Detections:</strong> ${results.detections.length}</p>
             <p><strong>Resolution:</strong> ${results.metadata.width}x${results
               .metadata.height}</p>
+            ${results.info?.screening ? html`
+              <p><strong>Screening Status:</strong> ${results.info.screening.status || "N/A"}</p>
+              ${results.info.screening.strides_completed ? html`
+                <p><strong>Strides Completed:</strong> ${results.info.screening.strides_completed.join(", ")}</p>
+              ` : ""}
+              ${results.info.screening.early_exit ? html`
+                <p><strong>Early Exit:</strong> Frame ${results.info.screening.early_exit_frame ?? "N/A"}</p>
+              ` : ""}
+            ` : ""}
 
             ${results.detections.length > 0
               ? html`
-                <h3 style="margin-top: var(--sl-spacing-medium);">Detection Snapshots</h3>
-                <sl-button size="small" @click="${() =>
-                  this.generateThumbnails()}">Generate Thumbnails</sl-button>
-                <div class="thumbnail-gallery" id="thumbnail-gallery"></div>
+                <h3 style="margin-top: var(--sl-spacing-medium);">
+                  Detection Snapshots (${Math.min(results.detections.length, 30)}${results.detections.length > 30 ? ` of ${results.detections.length}` : ""})
+                </h3>
+                <div class="thumbnail-gallery" id="thumbnail-gallery">
+                  ${results.detections.slice(0, 30).map((det) => {
+                    const [x, y, w, h] = det.bbox;
+                    const currentVideo = this.state.currentVideoPath.get() || "";
+                    const thumbUrl = `/thumbnail/?path=${encodeURIComponent(currentVideo)}&time=${det.timestamp}&bbox=${x},${y},${w},${h}&size=320`;
+                    return html`
+                      <div class="thumbnail-item" @click="${() => this.seekToTimestamp(det.timestamp)}" title="Jump to ${det.timestamp.toFixed(1)}s">
+                        <img loading="lazy" src="${thumbUrl}" alt="${det.category} detection" />
+                        <div class="thumbnail-label">
+                          ${det.category} ${(det.conf * 100).toFixed(0)}% @ ${det.timestamp.toFixed(1)}s
+                        </div>
+                      </div>
+                    `;
+                  })}
+                </div>
               `
               : ""}
           `
@@ -476,207 +513,13 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     `;
   }
 
-  async generateThumbnails() {
-    const results = this.state.currentResults.get();
-    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
-    const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery") as HTMLElement;
-
-    if (!results || !video || !gallery) return;
-
-    gallery.innerHTML = '<p style="text-align:center; padding:10px;">Generating thumbnails...</p>';
-
-    // Get unique detections (limit to first 20 for performance)
-    const uniqueDetections = results.detections.slice(0, 20);
-    const thumbnails: { url: string; det: Detection }[] = [];
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d")!;
-
-    // Use a separate, hidden video element for thumbnail generation so playback is uninterrupted
-    const tempVideo = document.createElement("video");
-    tempVideo.crossOrigin = "anonymous";
-    tempVideo.muted = true;
-    tempVideo.playsInline = true;
-    tempVideo.preload = "auto";
-
-    let tempHls: Hls | null = null;
-    const currentVideo = this.state.currentVideoPath.get();
-    const m3u8Url = `/videos/${currentVideo}.m3u8`;
-    const mp4Url = `/videos/${currentVideo}`;
-
-    if (Hls.isSupported()) {
-      tempHls = new Hls({
-        maxBufferLength: 10,
-        enableWorker: true,
-      });
-      tempHls.loadSource(m3u8Url);
-      tempHls.attachMedia(tempVideo);
-      tempHls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          console.warn("HLS error in thumbnail generator, falling back to direct MP4", data);
-          tempHls?.destroy();
-          tempHls = null;
-          tempVideo.src = mp4Url;
-        }
-      });
-    } else if (tempVideo.canPlayType("application/vnd.apple.mpegurl")) {
-      tempVideo.src = m3u8Url;
-    } else {
-      tempVideo.src = mp4Url;
+  seekToTimestamp(timestamp: number) {
+    const mainVideo = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
+    if (mainVideo) {
+      mainVideo.currentTime = timestamp;
+      mainVideo.scrollIntoView({ behavior: "smooth", block: "center" });
+      mainVideo.play();
     }
-
-    // Attach to DOM but hide it to ensure browser prioritizes loading
-    tempVideo.style.position = "absolute";
-    tempVideo.style.visibility = "hidden";
-    tempVideo.style.pointerEvents = "none";
-    tempVideo.style.zIndex = "-1";
-    this.shadowRoot?.appendChild(tempVideo);
-
-    // Helper to cleanup
-    const cleanup = () => {
-      if (tempHls) {
-        tempHls.destroy();
-        tempHls = null;
-      }
-      tempVideo.pause();
-      tempVideo.src = "";
-      tempVideo.remove();
-    };
-
-    const errors: string[] = [];
-    try {
-        // Wait for metadata to load so we can seek
-        await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("Timeout loading video metadata")), 15000);
-            tempVideo.onloadedmetadata = () => {
-                clearTimeout(timeout);
-                resolve();
-            };
-            tempVideo.onerror = () => {
-                 clearTimeout(timeout);
-                 reject(new Error("Failed to load video for processing"));
-            };
-        });
-
-        // We don't need to play the video, just seek
-        for (const det of uniqueDetections) {
-            try {
-                await new Promise<void>((resolve, reject) => {
-                    const timeout = setTimeout(() => reject(new Error("Seek timeout")), 5000);
-
-                    const onSeeked = () => {
-                        clearTimeout(timeout);
-                        resolve();
-                    };
-
-                    // Handle seek errors
-                    const onError = () => {
-                         clearTimeout(timeout);
-                         reject(new Error("Video error during seek"));
-                    };
-
-                    tempVideo.addEventListener("seeked", onSeeked, { once: true });
-                    tempVideo.addEventListener("error", onError, { once: true });
-                    tempVideo.currentTime = det.timestamp;
-                });
-
-                // Calculate crop
-                const [x, y, w, h] = det.bbox;
-                const vw = tempVideo.videoWidth;
-                const vh = tempVideo.videoHeight;
-
-                // Check for absolute vs normalized coordinates
-                // If coordinates are > 1.1, assume they are absolute pixels
-                const isAbsolute = x > 1.1 || y > 1.1 || w > 1.1 || h > 1.1;
-
-                let sx: number;
-                let sy: number;
-                let sw: number;
-                let sh: number;
-
-                if (isAbsolute) {
-                    sx = x;
-                    sy = y;
-                    sw = w;
-                    sh = h;
-                } else {
-                    sx = x * vw;
-                    sy = y * vh;
-                    sw = w * vw;
-                    sh = h * vh;
-                }
-
-                // Integer pixels
-                sx = Math.floor(sx);
-                sy = Math.floor(sy);
-                sw = Math.ceil(sw);
-                sh = Math.ceil(sh);
-
-                // Clamp to video dimensions
-                sx = Math.max(0, Math.min(sx, vw - 1));
-                sy = Math.max(0, Math.min(sy, vh - 1));
-
-                // Ensure width/height don't exceed bounds
-                sw = Math.min(sw, vw - sx);
-                sh = Math.min(sh, vh - sy);
-
-                if (sw > 0 && sh > 0) {
-                    canvas.width = sw;
-                    canvas.height = sh;
-                    ctx.drawImage(tempVideo, sx, sy, sw, sh, 0, 0, sw, sh);
-                    thumbnails.push({ url: canvas.toDataURL("image/jpeg", 0.7), det });
-                } else {
-                    errors.push(`Invalid dimensions for frame ${det.frame}: ${sw}x${sh} (bbox: ${det.bbox.map(n => n.toFixed(2))})`);
-                }
-            } catch (e) {
-                const msg = e instanceof Error ? e.message : String(e);
-                console.warn(`Failed to generate thumbnail for frame ${det.frame}:`, e);
-                errors.push(`Frame ${det.frame}: ${msg}`);
-            }
-      }
-    } catch (e) {
-      console.error("Thumbnail generation failed:", e);
-      gallery.innerHTML = `<p style="color:var(--sl-color-danger-600); text-align:center;">Failed to generate thumbnails: ${e instanceof Error ? e.message : String(e)}</p>`;
-      return;
-    } finally {
-      cleanup();
-    }
-
-    // Render thumbnails
-    gallery.innerHTML = "";
-    if (thumbnails.length === 0) {
-        let msg = "No thumbnails could be generated.";
-        if (errors.length > 0) {
-            msg += "<br><br>Errors:<br>" + errors.slice(0, 5).join("<br>") + (errors.length > 5 ? `<br>...and ${errors.length - 5} more` : "");
-        }
-        gallery.innerHTML = `<p style="text-align:center; color: var(--sl-color-neutral-600);">${msg}</p>`;
-        return;
-    }
-
-    thumbnails.forEach(({ url, det }) => {
-      const item = document.createElement("div");
-      item.className = "thumbnail-item";
-      // When clicking a thumbnail, seek the MAIN video
-      item.onclick = () => {
-         const mainVideo = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
-         if (mainVideo) {
-             mainVideo.currentTime = det.timestamp;
-             mainVideo.scrollIntoView({ behavior: "smooth", block: "center" });
-             mainVideo.play();
-         }
-      };
-
-      const img = document.createElement("img");
-      img.src = url;
-      img.alt = `${det.category} detection`;
-
-      const label = document.createElement("div");
-      label.className = "thumbnail-label";
-      label.textContent = `${det.category} ${(det.conf * 100).toFixed(0)}% @ ${det.timestamp.toFixed(1)}s`;
-
-      item.appendChild(img);
-      item.appendChild(label);
-      gallery.appendChild(item);
-    });
   }
 
   onVideoLoad(e: Event) {

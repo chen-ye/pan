@@ -1,4 +1,4 @@
-FROM denoland/deno:2.5.6
+FROM denoland/deno:2.9.7
 
 COPY --from=mwader/static-ffmpeg:latest /ffprobe /usr/local/bin/
 
@@ -7,19 +7,11 @@ WORKDIR /app
 # Copy everything
 COPY . .
 
-WORKDIR /app/backend
-# Install backend dependencies
+# Install workspace dependencies
 RUN deno install
 
-# Build frontend
+# Build frontend using Vite via Deno
 WORKDIR /app/frontend
-
-# Install dependencies via Deno (reads package.json)
-# We accept all permissions for install scripts if any
-RUN deno install --allow-scripts
-
-# Build using Vite via Deno
-# We skip tsc check to ensure build passes with existing types
 RUN deno run -A npm:vite build
 
 # Go back to root

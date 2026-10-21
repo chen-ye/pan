@@ -567,6 +567,19 @@ def process_single_video(
     video_path = item.path
     if item.file_size == 0:
         logger.warning("Skipping empty video (0 bytes): %s", video_path.name)
+        rel_name = (
+            str(video_path.relative_to(base_dir))
+            if base_dir and video_path.is_relative_to(base_dir)
+            else video_path.name
+        )
+        try:
+            SidecarScreeningManager.save_skipped_sidecar(
+                json_path=item.sidecar_path,
+                relative_video_name=rel_name,
+                reason="empty_file",
+            )
+        except Exception as sidecar_err:  # noqa: BLE001
+            logger.debug("Failed to write skipped sidecar: %s", sidecar_err)
         return {
             "success": True,
             "skipped": True,
@@ -617,6 +630,19 @@ def process_single_video(
                 elif status == "skipped":
                     reason = chunk.get("reason", "empty")
                     logger.warning("Skipped %s (%s)", video_path.name, reason)
+                    rel_name = (
+                        str(video_path.relative_to(base_dir))
+                        if base_dir and video_path.is_relative_to(base_dir)
+                        else video_path.name
+                    )
+                    try:
+                        SidecarScreeningManager.save_skipped_sidecar(
+                            json_path=item.sidecar_path,
+                            relative_video_name=rel_name,
+                            reason=reason,
+                        )
+                    except Exception as sidecar_err:  # noqa: BLE001
+                        logger.debug("Failed to write skipped sidecar: %s", sidecar_err)
                     return {
                         "success": True,
                         "skipped": True,

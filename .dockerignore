@@ -1,0 +1,11 @@
+.venv/
+models/
+data/
+.git/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+tests/
+*.log
+*.har
+.system_generated/
