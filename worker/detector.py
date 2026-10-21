@@ -191,6 +191,11 @@ class TorchVisionMegaDetector:
         force_cpu = self.device.type == "cpu"
         base_detector = run_detector.load_detector(target_model, force_cpu=force_cpu)
 
+        # Clean up duplicate root logger handlers injected by yolov5
+        root_logger = logging.getLogger()
+        if len(root_logger.handlers) > 1:
+            root_logger.handlers = root_logger.handlers[:1]
+
         # Extract underlying YOLOv5 DetectionModel
         self.model = base_detector.model.to(self.device).eval()
         if self.fp16:

@@ -40,6 +40,7 @@ services:
     environment:
       - DATA_DIR=/data
       - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - PYTHONUNBUFFERED=1
     ports:
       - "5000:5000"
     deploy:
@@ -58,6 +59,7 @@ services:
     environment:
       - DATA_DIR=/data
       - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - PYTHONUNBUFFERED=1
     ports:
       - "8080:8080"
     deploy:

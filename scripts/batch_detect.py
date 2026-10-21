@@ -658,6 +658,12 @@ def process_single_video(
             err_msg = ""
             final_status = ""
             is_early_exit = False
+            start_time = time.monotonic()
+            last_progress_log = start_time
+            processed_samples = 0
+            total_samples = 0
+            total_frames = 0
+            active_b = batch_size
 
             for chunk in processor.process_video_stream(
                 video_path=video_path,
@@ -676,11 +682,36 @@ def process_single_video(
                 status = chunk.get("status")
                 if status == "starting":
                     total_samples = chunk.get("total_samples", 0)
+                    total_frames = chunk.get("total_frames", 0)
                     active_b = chunk.get("batch_size", batch_size)
                     pbar_frames.reset(total=total_samples)
                     pbar_frames.set_description(f"Frames [DALI b={active_b}]: {video_path.name[:20]}")
+                    start_time = time.monotonic()
+                    last_progress_log = start_time
+                    processed_samples = 0
                 elif status == "progress":
-                    pbar_frames.update(chunk.get("batch_samples", 0))
+                    batch_samples = chunk.get("batch_samples", 0)
+                    processed_samples += batch_samples
+                    pbar_frames.update(batch_samples)
+                    now = time.monotonic()
+                    if now - last_progress_log >= 10.0:
+                        elapsed = max(now - start_time, 0.001)
+                        fps = processed_samples / elapsed
+                        pct = round(chunk.get("progress", 0.0) * 100)
+                        frame = chunk.get("frame", 0)
+                        tot_f = chunk.get("total_frames", total_frames)
+                        logger.info(
+                            "Progress [%s]: %d%% (%d/%d frames, %.1f fps, b=%s)",
+                            video_path.name,
+                            pct,
+                            frame,
+                            tot_f,
+                            fps,
+                            active_b,
+                        )
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        last_progress_log = now
                 elif status == "early_exit":
                     is_early_exit = True
                 elif status == "skipped":
@@ -1121,7 +1152,7 @@ def main() -> None:
         if args.watchdog_timeout > 0
         else None
     )
-    pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
+    pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False, disable=None)
     start_time = time.time()
 
     # Track metrics across passes
@@ -1150,7 +1181,7 @@ def main() -> None:
         metrics = {"processed": 0, "blank": 0, "detected": 0, "annotated": 0, "skipped": 0, "errors": 0}
 
         prewarmer.set_queue(queue, start_index=0, early_exit=early_exit)
-        pbar_vids = tqdm(queue, desc=pass_name, unit="vid")
+        pbar_vids = tqdm(queue, desc=pass_name, unit="vid", disable=None)
         try:
             for i_vid, item in enumerate(pbar_vids):
                 pbar_vids.set_postfix_str(item.path.name[:25])
@@ -1186,6 +1217,14 @@ def main() -> None:
                         metrics["annotated"] += 1
                 else:
                     metrics["errors"] += 1
+
+                if getattr(pbar_vids, "disable", False):
+                    logger.info(
+                        "[%s] Completed %d/%d video(s).",
+                        pass_name,
+                        i_vid + 1,
+                        len(queue),
+                    )
 
         finally:
             pbar_vids.close()
