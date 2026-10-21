@@ -3,7 +3,7 @@ import sys
 
 # Ensure shared libraries (e.g. Homebrew FFmpeg) are discoverable by ld.so before loading C extensions.
 BREW_LIB = "/home/linuxbrew/.linuxbrew/lib"
-if os.path.isdir(BREW_LIB):
+if __name__ == "__main__" and os.path.isdir(BREW_LIB):
     current_ld = os.environ.get("LD_LIBRARY_PATH", "")
     if sys.argv and sys.argv[0] != "-c" and BREW_LIB not in current_ld.split(":") and os.environ.get("_PAN_REEXEC") != "1":
         new_env = os.environ.copy()
@@ -14,6 +14,7 @@ if os.path.isdir(BREW_LIB):
 import json
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +31,25 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "MDv1000-redwood")
 DEFAULT_BATCH_SIZE = os.environ.get("PAN_BATCH_SIZE", "auto")
 
+_processor_lock = threading.Lock()
 processor: VideoProcessor | None = None
+
+
+def get_processor() -> VideoProcessor:
+    global processor
+    if processor is None:
+        with _processor_lock:
+            if processor is None:
+                processor = VideoProcessor(
+                    model_version=MODEL_VERSION,
+                    batch_size=DEFAULT_BATCH_SIZE,
+                    lazy=True,
+                )
+    return processor
+
+
 try:
-    processor = VideoProcessor(model_version=MODEL_VERSION, batch_size=DEFAULT_BATCH_SIZE)
+    processor = get_processor()
 except Exception as e:  # noqa: BLE001
     logger.error("Failed to initialize VideoProcessor: %s", e)
 
@@ -45,8 +62,10 @@ except ImportError:
 
 @app.route("/process", methods=["POST"])
 def handle_process() -> tuple[Response, int] | Response:
-    if processor is None:
-        return jsonify({"error": "VideoProcessor model not loaded"}), 500
+    try:
+        proc = get_processor()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"VideoProcessor model not loaded: {e}"}), 500
 
     data: dict[str, Any] = request.get_json(silent=True) or {}
     rel_path = data.get("path")
@@ -57,7 +76,7 @@ def handle_process() -> tuple[Response, int] | Response:
     video_path = Path(DATA_DIR) / rel_path
 
     def generate():
-        for chunk in processor.process_video_stream(
+        for chunk in proc.process_video_stream(
             video_path,
             rel_path=rel_path,
             batch_size=batch_size,
@@ -74,8 +93,10 @@ def handle_process() -> tuple[Response, int] | Response:
 @app.route("/screen", methods=["POST"])
 def handle_screen() -> tuple[Response, int] | Response:
     """Run progressive screening with early exit and prior frame range filtering."""
-    if processor is None:
-        return jsonify({"error": "VideoProcessor model not loaded"}), 500
+    try:
+        proc = get_processor()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"VideoProcessor model not loaded: {e}"}), 500
 
     data: dict[str, Any] = request.get_json(silent=True) or {}
     rel_path = data.get("path")
@@ -93,7 +114,7 @@ def handle_screen() -> tuple[Response, int] | Response:
     ranges = state.evaluated_ranges if state else None
 
     def generate():
-        for chunk in processor.process_video_stream(
+        for chunk in proc.process_video_stream(
             video_path,
             rel_path=rel_path,
             batch_size=batch_size,
@@ -114,8 +135,10 @@ def handle_screen() -> tuple[Response, int] | Response:
 @app.route("/annotate", methods=["POST"])
 def handle_annotate() -> tuple[Response, int] | Response:
     """Run post-screening annotation backfill on detected video without early exit."""
-    if processor is None:
-        return jsonify({"error": "VideoProcessor model not loaded"}), 500
+    try:
+        proc = get_processor()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"VideoProcessor model not loaded: {e}"}), 500
 
     data: dict[str, Any] = request.get_json(silent=True) or {}
     rel_path = data.get("path")
@@ -132,7 +155,7 @@ def handle_annotate() -> tuple[Response, int] | Response:
     ranges = state.evaluated_ranges if state else None
 
     def generate():
-        for chunk in processor.process_video_stream(
+        for chunk in proc.process_video_stream(
             video_path,
             rel_path=rel_path,
             batch_size=batch_size,
@@ -154,14 +177,37 @@ def handle_annotate() -> tuple[Response, int] | Response:
 @app.route("/status", methods=["GET"])
 def status() -> Response:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    proc = processor
+    is_loaded = getattr(proc, "is_model_loaded", False) if proc is not None else False
     return jsonify({
-        "status": "ready" if processor is not None else "error",
+        "status": "ready" if proc is not None else "error",
+        "model_loaded": is_loaded,
         "device": device,
         "model": MODEL_VERSION,
         "engine": "dali_nvdec",
-        "precision": "fp16" if getattr(processor, "fp16", False) else "fp32",
+        "precision": "fp16" if getattr(proc, "fp16", False) else "fp32",
         "batch_size_policy": DEFAULT_BATCH_SIZE,
     })
+
+
+@app.route("/warmup", methods=["POST"])
+def handle_warmup() -> tuple[Response, int] | Response:
+    """Pre-warm / boot the MegaDetector model ahead of time."""
+    try:
+        proc = get_processor()
+        _ = proc.detector
+        return jsonify({"status": "ready", "model_loaded": True})
+    except Exception as e:  # noqa: BLE001
+        logger.error("Failed to warm up model: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/unload", methods=["POST"])
+def handle_unload() -> tuple[Response, int] | Response:
+    """Unload the MegaDetector model from memory/GPU."""
+    if processor is not None:
+        processor.unload_model()
+    return jsonify({"status": "ready", "model_loaded": False})
 
 
 @app.route("/stats", methods=["GET"])

@@ -4,6 +4,7 @@ import gc
 import json
 import logging
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -521,6 +522,7 @@ class VideoProcessor:
         device: str | torch.device | None = None,
         fp16: bool = True,
         batch_size: int | str = "auto",
+        lazy: bool = False,
     ) -> None:
         self.model_version = model_version
         if device is None:
@@ -532,11 +534,40 @@ class VideoProcessor:
         self.device_id = (self.device.index or 0) if self.device.type == "cuda" else -1
         self.fp16 = fp16
         self.default_batch_size = batch_size
-        self.detector = TorchVisionMegaDetector(
-            model_version=self.model_version,
-            device=self.device,
-            fp16=self.fp16,
-        )
+        self._detector: TorchVisionMegaDetector | None = None
+        self._detector_lock = threading.Lock()
+        if not lazy:
+            self._ensure_detector()
+
+    @property
+    def is_model_loaded(self) -> bool:
+        """Return True if the underlying detector model has been booted into memory."""
+        return self._detector is not None
+
+    @property
+    def detector(self) -> TorchVisionMegaDetector:
+        return self._ensure_detector()
+
+    def _ensure_detector(self) -> TorchVisionMegaDetector:
+        if self._detector is None:
+            with self._detector_lock:
+                if self._detector is None:
+                    self._detector = TorchVisionMegaDetector(
+                        model_version=self.model_version,
+                        device=self.device,
+                        fp16=self.fp16,
+                    )
+        return self._detector
+
+    def unload_model(self) -> None:
+        """Unload detector model and free GPU memory."""
+        with self._detector_lock:
+            if self._detector is not None:
+                del self._detector
+                self._detector = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.info("TorchVisionMegaDetector unloaded.")
 
     def process_video_stream(
         self,
@@ -625,6 +656,13 @@ class VideoProcessor:
                 if total_sample_frames == 0:
                     logger.warning("Skipping video with 0 decodeable samples: %s", target_file.name)
                     yield {"status": "skipped", "reason": "zero_samples", "path": str(target_file)}
+                    return
+
+                try:
+                    self._ensure_detector()
+                except Exception as model_err:  # noqa: BLE001
+                    logger.error("Failed to load MegaDetector model: %s", model_err)
+                    yield {"error": f"Failed to load MegaDetector model: {model_err}"}
                     return
 
                 yield {
