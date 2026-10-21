@@ -115,3 +115,22 @@ Deno.test("M3u8Service - returns null for non-fragmented faststart MP4", async (
     }
   }
 });
+
+Deno.test("M3u8Service - returns null for truncated fMP4 where fragment exceeds file size", async () => {
+  const fmp4Data = createSyntheticFmp4(3, 1000);
+  // Truncate halfway through
+  const truncated = fmp4Data.subarray(0, fmp4Data.length - 50);
+  const tempPath = await Deno.makeTempFile({ suffix: ".mp4" });
+  await Deno.writeFile(tempPath, truncated);
+
+  try {
+    const result = await m3u8Service.parseFmp4(tempPath);
+    assertEquals(result, null);
+  } finally {
+    try {
+      await Deno.remove(tempPath);
+    } catch {
+      // ignore
+    }
+  }
+});

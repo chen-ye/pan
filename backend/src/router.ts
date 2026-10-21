@@ -372,7 +372,18 @@ router.get("/videos/:path*", async (ctx) => {
     if (range) {
         const bytes = range.replace(/bytes=/, "").split("-");
         const start = parseInt(bytes[0], 10);
-        const end = bytes[1] ? parseInt(bytes[1], 10) : fileSize - 1;
+        let end = bytes[1] ? parseInt(bytes[1], 10) : fileSize - 1;
+
+        if (isNaN(start) || start >= fileSize || start < 0) {
+          ctx.response.status = 416; // Range Not Satisfiable
+          ctx.response.headers.set("Content-Range", `bytes */${fileSize}`);
+          return;
+        }
+
+        if (isNaN(end) || end >= fileSize) {
+          end = fileSize - 1;
+        }
+
         const chunkSize = (end - start) + 1;
 
         await file.seek(start, Deno.SeekMode.Start);

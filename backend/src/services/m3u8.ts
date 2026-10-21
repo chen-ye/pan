@@ -61,7 +61,7 @@ export class M3u8Service {
           size = fileSize - offset;
         }
 
-        if (size < headerLen) break; // Corrupt atom size
+        if (size < headerLen || offset + size > fileSize) break; // Corrupt atom size or truncated file
 
         if (tag === "moov") {
           initSize = offset + size;
@@ -153,6 +153,10 @@ export class M3u8Service {
 
           if (mdatTag === "mdat" && mdatSize !== null) {
             const fragLength = moofSize + mdatSize;
+            if (moofOffset + fragLength > fileSize) {
+              // Fragment extends past EOF (file is truncated or corrupt)
+              return null;
+            }
             fragments.push({
               offset: moofOffset,
               length: fragLength,
@@ -346,7 +350,36 @@ export class M3u8Service {
     // 1. Try reading existing sidecar
     try {
       const content = await Deno.readTextFile(sidecarPath);
-      if (content.length > 0) return content;
+      if (content.length > 0) {
+        let isValid = true;
+        try {
+          const fileInfo = await Deno.stat(fullVideoPath);
+          for (const line of content.split("\n")) {
+            const match = line.match(/#EXT-X-BYTERANGE:(\d+)@(\d+)/) || line.match(/BYTERANGE="?(\d+)@(\d+)"?/);
+            if (match) {
+              const segLen = parseInt(match[1], 10);
+              const segOff = parseInt(match[2], 10);
+              if (segOff + segLen > fileInfo.size) {
+                isValid = false;
+                break;
+              }
+            }
+          }
+        } catch {
+          isValid = false;
+        }
+
+        if (isValid) {
+          return content;
+        } else {
+          console.warn(`Stale/truncated m3u8 sidecar detected for ${relVideoPath}, removing.`);
+          try {
+            await Deno.remove(sidecarPath);
+          } catch {
+            // ignore
+          }
+        }
+      }
     } catch {
       // Sidecar does not exist yet
     }

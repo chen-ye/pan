@@ -1,4 +1,4 @@
-import { Application, send } from "@oak/oak";
+import { Application, isHttpError, send } from "@oak/oak";
 import { join } from "@std/path";
 import { CONFIG } from "./src/config.ts";
 import { router } from "./src/router.ts";
@@ -35,8 +35,11 @@ app.use(async (ctx, next) => {
   try {
     await next();
   } catch (err: unknown) {
-    console.error("Server error:", err);
-    ctx.response.status = 500;
+    const status = isHttpError(err) ? err.status : 500;
+    if (status >= 500) {
+      console.error("Server error:", err);
+    }
+    ctx.response.status = status;
     ctx.response.body = {
       error: err instanceof Error ? err.message : String(err),
     };

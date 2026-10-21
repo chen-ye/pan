@@ -272,6 +272,22 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const m3u8Url = `/videos/${path}.m3u8`;
     const mp4Url = `/videos/${path}`;
 
+    const fallbackToMp4 = (reason?: string) => {
+      if (this.hls) {
+        this.hls.destroy();
+        this.hls = null;
+      }
+      if (reason) {
+        console.info(`HLS fallback to direct MP4 (${reason}): ${path}`);
+      }
+      const currentTime = video.currentTime;
+      video.src = mp4Url;
+      if (currentTime > 0) {
+        video.currentTime = currentTime;
+      }
+      video.play().catch(() => {});
+    };
+
     if (Hls.isSupported()) {
       const hls = new Hls({
         maxBufferLength: 30,
@@ -285,22 +301,18 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
-          console.warn(
-            "HLS fatal error, falling back to direct MP4 source:",
-            data.details,
-            "Error:", data.error?.message || data.error,
-          );
-          hls.destroy();
-          this.hls = null;
-          video.src = mp4Url;
+          fallbackToMp4(`${data.details}: ${data.error?.message || data.error}`);
         }
       });
       this.hls = hls;
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       // Native HLS support (Safari on iOS where MSE is not supported)
       video.src = m3u8Url;
+      video.onerror = () => {
+        fallbackToMp4("Native HLS error");
+      };
     } else {
-      video.src = mp4Url;
+      fallbackToMp4();
     }
   }
 
