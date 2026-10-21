@@ -293,15 +293,114 @@ export class VideoDetail extends SignalWatcher(LitElement) {
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
         enableWorker: true,
+        manifestLoadingTimeOut: 45000,
+        manifestLoadingMaxRetry: 4,
+        manifestLoadingRetryDelay: 1000,
+        manifestLoadingMaxRetryTimeout: 64000,
+        manifestLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 45000,
+            maxLoadTimeMs: 60000,
+            timeoutRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 1000,
+              maxRetryDelayMs: 5000,
+              backoff: "exponential",
+            },
+            errorRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 1000,
+              maxRetryDelayMs: 5000,
+              backoff: "exponential",
+            },
+          },
+        },
+        playlistLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 45000,
+            maxLoadTimeMs: 60000,
+            timeoutRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 1000,
+              maxRetryDelayMs: 5000,
+              backoff: "exponential",
+            },
+            errorRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 1000,
+              maxRetryDelayMs: 5000,
+              backoff: "exponential",
+            },
+          },
+        },
+        fragLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 30000,
+            maxLoadTimeMs: 60000,
+            timeoutRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 500,
+              maxRetryDelayMs: 4000,
+              backoff: "exponential",
+            },
+            errorRetry: {
+              maxNumRetry: 4,
+              retryDelayMs: 1000,
+              maxRetryDelayMs: 4000,
+              backoff: "exponential",
+            },
+          },
+        },
       });
+
+      let networkRetryCount = 0;
+      const MAX_NETWORK_RETRIES = 3;
+
       hls.loadSource(m3u8Url);
       hls.attachMedia(video);
+
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        networkRetryCount = 0;
         video.play().catch(() => {});
       });
+
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        networkRetryCount = 0;
+      });
+
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
-          fallbackToMp4(`${data.details}: ${data.error?.message || data.error}`);
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR: {
+              const status = data.response?.code;
+              // If the server explicitly responded with 404, this video is not an fMP4
+              if (status === 404) {
+                fallbackToMp4("Not a fragmented MP4 (404)");
+                return;
+              }
+              if (networkRetryCount < MAX_NETWORK_RETRIES) {
+                networkRetryCount++;
+                console.warn(
+                  `HLS network error (${data.details}), recovering attempt ${networkRetryCount}/${MAX_NETWORK_RETRIES}...`
+                );
+                setTimeout(() => {
+                  if (this.hls === hls) {
+                    hls.startLoad();
+                  }
+                }, 1000 * networkRetryCount);
+                return;
+              }
+              fallbackToMp4(`${data.details}: ${data.error?.message || data.error}`);
+              break;
+            }
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn(`HLS media error (${data.details}), attempting recovery...`);
+              hls.recoverMediaError();
+              break;
+            default:
+              fallbackToMp4(`${data.details}: ${data.error?.message || data.error}`);
+              break;
+          }
         }
       });
       this.hls = hls;

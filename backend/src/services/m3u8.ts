@@ -17,6 +17,7 @@ export interface ParseResult {
 export class M3u8Service {
   private inFlight = new Map<string, Promise<string | null>>();
   private initCache = new Map<string, Uint8Array>();
+  private sidecarCache = new Map<string, string>();
 
   /**
    * Parses an fMP4 file to extract its initialization segment and fragment byte ranges.
@@ -503,6 +504,10 @@ export class M3u8Service {
   async getOrGenerateSidecar(relVideoPath: string): Promise<string | null> {
     if (relVideoPath.includes("..")) return null;
 
+    // Fast-path: In-memory cache
+    const cached = this.sidecarCache.get(relVideoPath);
+    if (cached) return cached;
+
     const fullVideoPath = join(CONFIG.DATA_DIR, relVideoPath);
     const sidecarPath = fullVideoPath + ".m3u8";
 
@@ -518,15 +523,17 @@ export class M3u8Service {
 
         try {
           const fileInfo = await Deno.stat(fullVideoPath);
-          for (const line of content.split("\n")) {
-            const match = line.match(/#EXT-X-BYTERANGE:(\d+)@(\d+)/) || line.match(/BYTERANGE="?(\d+)@(\d+)"?/);
+          // Fast validation: Check the last fragment's byte range against file size
+          const lines = content.trimEnd().split("\n");
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const match = lines[i].match(/#EXT-X-BYTERANGE:(\d+)@(\d+)/);
             if (match) {
               const segLen = parseInt(match[1], 10);
               const segOff = parseInt(match[2], 10);
               if (segOff + segLen > fileInfo.size) {
                 isValid = false;
-                break;
               }
+              break;
             }
           }
         } catch {
@@ -534,6 +541,11 @@ export class M3u8Service {
         }
 
         if (isValid) {
+          if (this.sidecarCache.size > 1000) {
+            const firstKey = this.sidecarCache.keys().next().value;
+            if (firstKey) this.sidecarCache.delete(firstKey);
+          }
+          this.sidecarCache.set(relVideoPath, content);
           return content;
         } else {
           console.warn(`Stale/legacy m3u8 sidecar detected for ${relVideoPath}, regenerating.`);
@@ -571,6 +583,12 @@ export class M3u8Service {
         } catch (writeErr) {
           console.warn(`Failed to write m3u8 sidecar to disk for ${relVideoPath}, serving in-memory:`, writeErr);
         }
+
+        if (this.sidecarCache.size > 1000) {
+          const firstKey = this.sidecarCache.keys().next().value;
+          if (firstKey) this.sidecarCache.delete(firstKey);
+        }
+        this.sidecarCache.set(relVideoPath, m3u8Content);
 
         return m3u8Content;
       } catch (err) {

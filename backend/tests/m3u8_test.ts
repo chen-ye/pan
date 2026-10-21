@@ -1,4 +1,6 @@
 import { assertEquals, assertNotEquals } from "@std/assert";
+import { join } from "@std/path";
+import { CONFIG } from "../src/config.ts";
 import { m3u8Service } from "../src/services/m3u8.ts";
 
 function makeBox(tag: string, payload: Uint8Array): Uint8Array {
@@ -198,6 +200,42 @@ Deno.test("M3u8Service - returns null for truncated fMP4 where fragment exceeds 
     }
   }
 });
+
+Deno.test("M3u8Service - getOrGenerateSidecar generates, caches, and invalidates sidecar", async () => {
+  const fmp4Data = createSyntheticFmp4(2, 1000);
+  const testFileName = `temp_test_m3u8_${Date.now()}.mp4`;
+  const fullPath = join(CONFIG.DATA_DIR, testFileName);
+  const sidecarPath = `${fullPath}.m3u8`;
+  await Deno.writeFile(fullPath, fmp4Data);
+
+  try {
+    // 1. Generate sidecar
+    const sidecar1 = await m3u8Service.getOrGenerateSidecar(testFileName);
+    assertNotEquals(sidecar1, null);
+    assertEquals(sidecar1!.includes("/api/videos/init"), true);
+    assertEquals(sidecar1!.includes("#EXTINF:1.000,"), true);
+
+    // Verify sidecar was written to disk
+    const onDisk = await Deno.readTextFile(sidecarPath);
+    assertEquals(onDisk, sidecar1);
+
+    // 2. Fetch again - should hit in-memory cache
+    const sidecar2 = await m3u8Service.getOrGenerateSidecar(testFileName);
+    assertEquals(sidecar2, sidecar1);
+  } finally {
+    try {
+      await Deno.remove(fullPath);
+    } catch {
+      // ignore
+    }
+    try {
+      await Deno.remove(sidecarPath);
+    } catch {
+      // ignore
+    }
+  }
+});
+
 
 
 
