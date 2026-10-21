@@ -29,11 +29,23 @@ test("debug video playback and Hls.js", async ({ page }) => {
   });
 
   console.log("Navigating to test video...");
-  await page.goto("/?video=NVR-unprocessed%2FBackyard%2F2025%2F07%2F07%2FBackyard_00_20250707124018.mp4", {
+  await page.goto("/?video=NVR-unknown%2FBackyard%2F2026%2F06%2F18%2FBackyard_00_20260618122217.mp4", {
     waitUntil: "domcontentloaded",
   });
 
-  await page.waitForTimeout(6000);
+  await page.waitForTimeout(4000);
+
+  // Trigger seek to 10 seconds
+  console.log("Seeking to 10s...");
+  await page.evaluate(() => {
+    const app = document.querySelector("app-root");
+    const vd = app?.shadowRoot?.querySelector("video-detail") as any;
+    if (vd?.seekToTimestamp) {
+      vd.seekToTimestamp(10);
+    }
+  });
+
+  await page.waitForTimeout(4000);
 
   const videoStats = await page.evaluate(() => {
     const app = document.querySelector("app-root");

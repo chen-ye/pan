@@ -324,6 +324,38 @@ router.get("/api/videos/m3u8", async (ctx) => {
   }
 });
 
+// 7b. Serve Video-Only Init Segment for HLS
+router.get("/api/videos/init", async (ctx) => {
+  const videoPath = ctx.request.url.searchParams.get("path");
+  if (!videoPath || videoPath.includes("..")) {
+    ctx.throw(400, "Invalid path");
+    return;
+  }
+
+  const fullPath = join(CONFIG.DATA_DIR, videoPath);
+  try {
+    const initSegment = await m3u8Service.getVideoOnlyInitSegment(fullPath);
+    if (!initSegment) {
+      ctx.throw(404, "Video initialization segment not available");
+      return;
+    }
+    ctx.response.status = 200;
+    ctx.response.headers.set("Content-Type", "video/mp4");
+    ctx.response.headers.set("Content-Length", String(initSegment.byteLength));
+    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+    ctx.response.headers.set("Cache-Control", "public, max-age=86400, immutable");
+    ctx.response.body = initSegment;
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) {
+      ctx.throw(404, `Video not found: ${videoPath}`);
+    } else if (err && typeof err === "object" && "status" in err) {
+      throw err;
+    } else {
+      ctx.throw(500, `Error generating video init segment: ${(err as Error).message}`);
+    }
+  }
+});
+
 // 8. Serve Videos
 router.get("/videos/:path*", async (ctx) => {
   const videoPath = ctx.params.path;

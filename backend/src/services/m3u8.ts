@@ -16,6 +16,7 @@ export interface ParseResult {
 
 export class M3u8Service {
   private inFlight = new Map<string, Promise<string | null>>();
+  private initCache = new Map<string, Uint8Array>();
 
   /**
    * Parses an fMP4 file to extract its initialization segment and fragment byte ranges.
@@ -285,9 +286,163 @@ export class M3u8Service {
   }
 
   /**
+   * Helper to read a 4-character ASCII tag from a buffer.
+   */
+  private getTag(buf: Uint8Array, offset: number): string {
+    return String.fromCharCode(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
+  }
+
+  /**
+   * Generates or retrieves a cached video-only initialization segment (ftyp + moov)
+   * with any non-video tracks (e.g. audio) stripped out so that browsers initialize
+   * a pure video SourceBuffer and avoid timestamp drift crashes.
+   */
+  async getVideoOnlyInitSegment(filePath: string): Promise<Uint8Array | null> {
+    const cached = this.initCache.get(filePath);
+    if (cached) return cached;
+
+    let file: Deno.FsFile | null = null;
+    try {
+      file = await Deno.open(filePath, { read: true });
+      const headerBuf = new Uint8Array(32768);
+      const bytesRead = await file.read(headerBuf);
+      if (!bytesRead || bytesRead < 32) return null;
+
+      const view = new DataView(headerBuf.buffer, headerBuf.byteOffset, bytesRead);
+      const ftypLen = view.getUint32(0);
+      const ftypTag = this.getTag(headerBuf, 4);
+      if (ftypTag !== "ftyp" || ftypLen < 8 || ftypLen > bytesRead) return null;
+
+      const moovOffset = ftypLen;
+      if (moovOffset + 8 > bytesRead) return null;
+
+      let moovLen = view.getUint32(moovOffset);
+      let moovHeaderLen = 8;
+      if (moovLen === 1) {
+        moovLen = Number(view.getBigUint64(moovOffset + 8));
+        moovHeaderLen = 16;
+      }
+      const moovTag = this.getTag(headerBuf, moovOffset + 4);
+      if (moovTag !== "moov" || moovLen < moovHeaderLen) return null;
+
+      let fullMoov: Uint8Array;
+      if (moovOffset + moovLen <= bytesRead) {
+        fullMoov = headerBuf.subarray(moovOffset, moovOffset + moovLen);
+      } else {
+        fullMoov = new Uint8Array(moovLen);
+        await file.seek(moovOffset, Deno.SeekMode.Start);
+        await file.read(fullMoov);
+      }
+
+      const moovView = new DataView(fullMoov.buffer, fullMoov.byteOffset, fullMoov.byteLength);
+      let p = moovHeaderLen;
+      const moovEnd = moovLen;
+      const keptBoxes: Uint8Array[] = [];
+      const videoTrackIds = new Set<number>();
+      let mvexBox: Uint8Array | null = null;
+
+      while (p + 8 <= moovEnd) {
+        const bSize = moovView.getUint32(p);
+        const bTag = this.getTag(fullMoov, p + 4);
+        if (bSize < 8 || p + bSize > moovEnd) break;
+
+        if (bTag === "trak") {
+          const trakBytes = fullMoov.subarray(p, p + bSize);
+          let isVideo = false;
+          let trackId = 0;
+
+          for (let i = 0; i <= trakBytes.length - 16; i++) {
+            if (this.getTag(trakBytes, i) === "hdlr" && i + 16 <= trakBytes.length) {
+              const handler = this.getTag(trakBytes, i + 12);
+              if (handler === "vide") isVideo = true;
+            }
+            if (this.getTag(trakBytes, i) === "tkhd" && i + 28 <= trakBytes.length) {
+              const ver = trakBytes[i + 4];
+              const tkhdView = new DataView(trakBytes.buffer, trakBytes.byteOffset + i);
+              trackId = ver === 0 ? tkhdView.getUint32(16) : tkhdView.getUint32(24);
+            }
+          }
+
+          if (isVideo) {
+            videoTrackIds.add(trackId);
+            keptBoxes.push(trakBytes);
+          }
+        } else if (bTag === "mvex") {
+          mvexBox = fullMoov.subarray(p, p + bSize);
+        } else {
+          keptBoxes.push(fullMoov.subarray(p, p + bSize));
+        }
+        p += bSize;
+      }
+
+      if (mvexBox) {
+        let q = 8;
+        const mvexView = new DataView(mvexBox.buffer, mvexBox.byteOffset, mvexBox.byteLength);
+        const keptMvex: Uint8Array[] = [];
+        while (q + 8 <= mvexBox.length) {
+          const s = mvexView.getUint32(q);
+          const t = this.getTag(mvexBox, q + 4);
+          if (s < 8 || q + s > mvexBox.length) break;
+          if (t === "trex" && q + 16 <= mvexBox.length) {
+            const trkId = mvexView.getUint32(q + 12);
+            if (videoTrackIds.has(trkId)) {
+              keptMvex.push(mvexBox.subarray(q, q + s));
+            }
+          } else {
+            keptMvex.push(mvexBox.subarray(q, q + s));
+          }
+          q += s;
+        }
+
+        const mvexPayloadLen = keptMvex.reduce((acc, b) => acc + b.length, 0);
+        const newMvex = new Uint8Array(8 + mvexPayloadLen);
+        new DataView(newMvex.buffer).setUint32(0, newMvex.length);
+        newMvex.set(new TextEncoder().encode("mvex"), 4);
+        let mp = 8;
+        for (const b of keptMvex) {
+          newMvex.set(b, mp);
+          mp += b.length;
+        }
+        keptBoxes.push(newMvex);
+      }
+
+      const moovPayloadLen = keptBoxes.reduce((acc, b) => acc + b.length, 0);
+      const newMoov = new Uint8Array(8 + moovPayloadLen);
+      new DataView(newMoov.buffer).setUint32(0, newMoov.length);
+      newMoov.set(new TextEncoder().encode("moov"), 4);
+      let op = 8;
+      for (const b of keptBoxes) {
+        newMoov.set(b, op);
+        op += b.length;
+      }
+
+      const out = new Uint8Array(ftypLen + newMoov.length);
+      out.set(headerBuf.subarray(0, ftypLen), 0);
+      out.set(newMoov, ftypLen);
+
+      // Keep cache bounded (max 500 entries)
+      if (this.initCache.size > 500) {
+        const firstKey = this.initCache.keys().next().value;
+        if (firstKey) this.initCache.delete(firstKey);
+      }
+      this.initCache.set(filePath, out);
+
+      return out;
+    } finally {
+      if (file) {
+        try {
+          file.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
    * Generates standard HLS Byte-Range playlist (RFC 8216) content.
    */
-  buildM3u8Content(result: ParseResult, mediaUri: string): string {
+  buildM3u8Content(result: ParseResult, mediaUri: string, initUri?: string): string {
     const { timescale, initSize, fragments } = result;
 
     let maxDuration = 1.0;
@@ -318,13 +473,17 @@ export class M3u8Service {
       });
     }
 
+    const mapTag = initUri
+      ? `#EXT-X-MAP:URI="${initUri}"`
+      : `#EXT-X-MAP:URI="${mediaUri}",BYTERANGE="${initSize}@0"`;
+
     const lines: string[] = [
       "#EXTM3U",
       "#EXT-X-VERSION:7",
       `#EXT-X-TARGETDURATION:${Math.ceil(maxDuration)}`,
       "#EXT-X-MEDIA-SEQUENCE:0",
       "#EXT-X-PLAYLIST-TYPE:VOD",
-      `#EXT-X-MAP:URI="${mediaUri}",BYTERANGE="${initSize}@0"`,
+      mapTag,
       "",
     ];
 
@@ -352,6 +511,11 @@ export class M3u8Service {
       const content = await Deno.readTextFile(sidecarPath);
       if (content.length > 0) {
         let isValid = true;
+        // Invalidate legacy sidecars that don't use the video-only init segment endpoint
+        if (!content.includes("/api/videos/init")) {
+          isValid = false;
+        }
+
         try {
           const fileInfo = await Deno.stat(fullVideoPath);
           for (const line of content.split("\n")) {
@@ -372,7 +536,7 @@ export class M3u8Service {
         if (isValid) {
           return content;
         } else {
-          console.warn(`Stale/truncated m3u8 sidecar detected for ${relVideoPath}, removing.`);
+          console.warn(`Stale/legacy m3u8 sidecar detected for ${relVideoPath}, regenerating.`);
           try {
             await Deno.remove(sidecarPath);
           } catch {
@@ -396,7 +560,8 @@ export class M3u8Service {
         if (!parseResult) return null;
 
         const mediaUri = basename(relVideoPath);
-        const m3u8Content = this.buildM3u8Content(parseResult, mediaUri);
+        const initUri = `/api/videos/init?path=${encodeURIComponent(relVideoPath)}`;
+        const m3u8Content = this.buildM3u8Content(parseResult, mediaUri, initUri);
 
         // Write sidecar atomically using temporary file (catch write errors so playback works even if storage is read-only)
         try {

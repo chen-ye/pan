@@ -90,6 +90,71 @@ Deno.test("M3u8Service - parses fragmented MP4 and generates valid HLS playlist"
     assertEquals(playlist.includes("#EXT-X-BYTERANGE:"), true);
     assertEquals(playlist.includes("#EXT-X-ENDLIST"), true);
     assertEquals(playlist.includes("#EXTINF:1.000,"), true);
+
+    const playlistWithInit = m3u8Service.buildM3u8Content(result, "test.mp4", "/api/videos/init?path=test.mp4");
+    assertEquals(playlistWithInit.includes('#EXT-X-MAP:URI="/api/videos/init?path=test.mp4"'), true);
+    assertEquals(playlistWithInit.includes("BYTERANGE="), false);
+  } finally {
+    try {
+      await Deno.remove(tempPath);
+    } catch {
+      // ignore
+    }
+  }
+});
+
+Deno.test("M3u8Service - getVideoOnlyInitSegment extracts video trak and drops audio trak", async () => {
+  const ftyp = makeBox("ftyp", new Uint8Array([0x69, 0x73, 0x6f, 0x6d, 0, 0, 2, 0]));
+  const mvhd = makeBox("mvhd", new Uint8Array(100));
+
+  // Video track: tkhd (track 1) + mdia (hdlr 'vide')
+  const tkhd1Payload = new Uint8Array(24);
+  new DataView(tkhd1Payload.buffer).setUint32(12, 1); // track ID 1
+  const tkhd1 = makeBox("tkhd", tkhd1Payload);
+  const hdlr1Payload = new Uint8Array(20);
+  hdlr1Payload.set(new TextEncoder().encode("vide"), 8); // 'vide' at offset 8 in payload (16 from tag)
+  const hdlr1 = makeBox("hdlr", hdlr1Payload);
+  const mdia1 = makeBox("mdia", hdlr1);
+  const trak1 = makeBox("trak", concatBuffers(tkhd1, mdia1));
+
+  // Audio track: tkhd (track 2) + mdia (hdlr 'soun')
+  const tkhd2Payload = new Uint8Array(24);
+  new DataView(tkhd2Payload.buffer).setUint32(12, 2); // track ID 2
+  const tkhd2 = makeBox("tkhd", tkhd2Payload);
+  const hdlr2Payload = new Uint8Array(20);
+  hdlr2Payload.set(new TextEncoder().encode("soun"), 8); // 'soun'
+  const hdlr2 = makeBox("hdlr", hdlr2Payload);
+  const mdia2 = makeBox("mdia", hdlr2);
+  const trak2 = makeBox("trak", concatBuffers(tkhd2, mdia2));
+
+  // mvex with trex 1 and trex 2
+  const trex1Payload = new Uint8Array(24);
+  new DataView(trex1Payload.buffer).setUint32(4, 1); // track ID 1
+  const trex1 = makeBox("trex", trex1Payload);
+
+  const trex2Payload = new Uint8Array(24);
+  new DataView(trex2Payload.buffer).setUint32(4, 2); // track ID 2
+  const trex2 = makeBox("trex", trex2Payload);
+
+  const mvex = makeBox("mvex", concatBuffers(trex1, trex2));
+  const moov = makeBox("moov", concatBuffers(mvhd, trak1, trak2, mvex));
+
+  const mp4Data = concatBuffers(ftyp, moov);
+  const tempPath = await Deno.makeTempFile({ suffix: ".mp4" });
+  await Deno.writeFile(tempPath, mp4Data);
+
+  try {
+    const initSeg = await m3u8Service.getVideoOnlyInitSegment(tempPath);
+    assertNotEquals(initSeg, null);
+    if (!initSeg) return;
+
+    // Verify it is smaller than original because audio trak and trex were stripped
+    assertEquals(initSeg.length < mp4Data.length, true);
+
+    // Verify it contains 'vide' and does NOT contain 'soun'
+    const text = new TextDecoder("latin1").decode(initSeg);
+    assertEquals(text.includes("vide"), true);
+    assertEquals(text.includes("soun"), false);
   } finally {
     try {
       await Deno.remove(tempPath);
@@ -118,7 +183,6 @@ Deno.test("M3u8Service - returns null for non-fragmented faststart MP4", async (
 
 Deno.test("M3u8Service - returns null for truncated fMP4 where fragment exceeds file size", async () => {
   const fmp4Data = createSyntheticFmp4(3, 1000);
-  // Truncate halfway through
   const truncated = fmp4Data.subarray(0, fmp4Data.length - 50);
   const tempPath = await Deno.makeTempFile({ suffix: ".mp4" });
   await Deno.writeFile(tempPath, truncated);
@@ -134,3 +198,6 @@ Deno.test("M3u8Service - returns null for truncated fMP4 where fragment exceeds 
     }
   }
 });
+
+
+
