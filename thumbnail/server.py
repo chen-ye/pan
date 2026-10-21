@@ -1,6 +1,8 @@
 import logging
 import os
 import subprocess
+import threading
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -11,6 +13,35 @@ logger = logging.getLogger("thumbnail-service")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
 PORT = int(os.environ.get("PORT", "8080"))
+
+MAX_CONCURRENT_DECODES = int(os.environ.get("MAX_CONCURRENT_DECODES", "3"))
+DECODE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_DECODES)
+DECODE_TIMEOUT = int(os.environ.get("DECODE_TIMEOUT", "20"))
+
+MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "2048"))
+CACHE_LOCK = threading.Lock()
+THUMBNAIL_CACHE: OrderedDict[str, bytes] = OrderedDict()
+
+
+def get_cached_thumbnail(key: str) -> bytes | None:
+    with CACHE_LOCK:
+        if key in THUMBNAIL_CACHE:
+            THUMBNAIL_CACHE.move_to_end(key)
+            return THUMBNAIL_CACHE[key]
+    return None
+
+
+def put_cached_thumbnail(key: str, data: bytes) -> None:
+    with CACHE_LOCK:
+        THUMBNAIL_CACHE[key] = data
+        THUMBNAIL_CACHE.move_to_end(key)
+        if len(THUMBNAIL_CACHE) > MAX_CACHE_ENTRIES:
+            THUMBNAIL_CACHE.popitem(last=False)
+
+
+def clear_thumbnail_cache() -> None:
+    with CACHE_LOCK:
+        THUMBNAIL_CACHE.clear()
 
 
 class ThumbnailHandler(BaseHTTPRequestHandler):
@@ -51,8 +82,8 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             if not target_path.is_file():
                 self.send_error(404, f"File not found: {rel_path}")
                 return
-        except (OSError, ValueError) as e:
-            logger.warning("Error resolving path '%s': %s", rel_path, e)
+        except (OSError, ValueError) as exc:
+            logger.warning("Error resolving path '%s': %s", rel_path, exc)
             self.send_error(400, "Invalid path")
             return
 
@@ -76,31 +107,65 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
         bbox_str = params.get("bbox", [""])[0]
         if bbox_str:
             try:
-                coords = [float(v.strip()) for v in bbox_str.split(",")]
+                coords = [float(val.strip()) for val in bbox_str.split(",")]
                 if len(coords) == 4:
-                    x, y, w, h = coords
+                    box_x, box_y, box_w, box_h = coords
                     # Check if normalized [0, 1]
-                    if max(x, y, w, h) <= 1.0:
-                        w_clamped = max(0.01, min(1.0, w))
-                        h_clamped = max(0.01, min(1.0, h))
-                        x_clamped = max(0.0, min(1.0 - w_clamped, x))
-                        y_clamped = max(0.0, min(1.0 - h_clamped, y))
+                    if max(box_x, box_y, box_w, box_h) <= 1.0:
+                        w_clamped = max(0.01, min(1.0, box_w))
+                        h_clamped = max(0.01, min(1.0, box_h))
+                        x_clamped = max(0.0, min(1.0 - w_clamped, box_x))
+                        y_clamped = max(0.0, min(1.0 - h_clamped, box_y))
                         vf_filters.append(
                             f"crop=w=iw*{w_clamped:.4f}:h=ih*{h_clamped:.4f}:x=iw*{x_clamped:.4f}:y=ih*{y_clamped:.4f}"
                         )
                     else:
-                        vf_filters.append(f"crop=w={int(w)}:h={int(h)}:x={int(x)}:y={int(y)}")
+                        vf_filters.append(f"crop=w={int(box_w)}:h={int(box_h)}:x={int(box_x)}:y={int(box_y)}")
             except ValueError:
                 logger.debug("Failed to parse bbox '%s', falling back to uncropped", bbox_str)
 
         vf_filters.append(f"scale='min({size},iw)':-1")
         vf = ",".join(vf_filters)
 
-        # First attempt: hardware-accelerated decode via NVDEC (cuda)
-        cmd_cuda = [
+        cache_key = f"{rel_path}:{timestamp:.3f}:{bbox_str}:{size}"
+        cached_bytes = get_cached_thumbnail(cache_key)
+        if cached_bytes is not None:
+            self._send_image_response(cached_bytes, send_body=send_body)
+            return
+
+        # Acquire concurrency semaphore to stay strictly within NVDEC hardware session limits
+        acquired = DECODE_SEMAPHORE.acquire(timeout=30)
+        if not acquired:
+            logger.error("GPU decode queue busy, semaphore wait timed out for %s", rel_path)
+            self.send_error(503, "GPU decode service busy, please retry")
+            return
+
+        try:
+            # Re-check cache in case another worker thread generated it while waiting
+            cached_bytes = get_cached_thumbnail(cache_key)
+            if cached_bytes is not None:
+                self._send_image_response(cached_bytes, send_body=send_body)
+                return
+
+            jpeg_bytes = self._decode_frame_gpu(target_path, rel_path, timestamp, vf)
+            if jpeg_bytes is None:
+                self.send_error(500, "GPU frame decode failed")
+                return
+
+            put_cached_thumbnail(cache_key, jpeg_bytes)
+            self._send_image_response(jpeg_bytes, send_body=send_body)
+        finally:
+            DECODE_SEMAPHORE.release()
+
+    def _decode_frame_gpu(self, target_path: Path, rel_path: str, timestamp: float, vf: str) -> bytes | None:
+        """Hardware-accelerated decode via NVDEC (cuda). CPU fallback is intentionally omitted."""
+        cmd = [
             FFMPEG_BIN,
             "-hwaccel",
             "cuda",
+            "-threads",
+            "1",
+            "-nostdin",
             "-ss",
             f"{timestamp:.3f}",
             "-i",
@@ -118,64 +183,39 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             "pipe:1",
         ]
 
-        jpeg_bytes: bytes | None = None
         try:
             proc = subprocess.run(
-                cmd_cuda,
+                cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
-                timeout=8,
+                timeout=DECODE_TIMEOUT,
                 check=False,
             )
             if proc.returncode == 0 and proc.stdout:
-                jpeg_bytes = proc.stdout
-            else:
-                logger.debug(
-                    "CUDA decode returned code %d, falling back to CPU: %s",
-                    proc.returncode,
-                    proc.stderr.decode("utf-8", errors="replace"),
-                )
-        except (subprocess.SubprocessError, OSError) as e:
-            logger.debug("CUDA decode failed (%s), falling back to CPU", e)
+                return proc.stdout
 
-        # Fallback attempt: CPU decode
-        if not jpeg_bytes:
-            cmd_cpu = [
-                FFMPEG_BIN,
-                "-ss",
-                f"{timestamp:.3f}",
-                "-i",
-                str(target_path),
-                "-vf",
-                vf,
-                "-vframes",
-                "1",
-                "-f",
-                "image2",
-                "-c:v",
-                "mjpeg",
-                "-q:v",
-                "3",
-                "pipe:1",
-            ]
-            try:
-                proc = subprocess.run(
-                    cmd_cpu,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                if proc.returncode == 0 and proc.stdout:
-                    jpeg_bytes = proc.stdout
-                else:
-                    err_msg = proc.stderr.decode("utf-8", errors="replace")
-                    logger.error("CPU decode failed for %s at %ss: %s", rel_path, timestamp, err_msg)
-                    self.send_error(500, f"Frame decode failed: {err_msg[:200]}")
-                    return
-            except (subprocess.SubprocessError, OSError) as e:
-                logger.error("CPU decode process error: %s", e)
-                self.send_error(500, "Frame decode error")
-                return
+            err_text = proc.stderr.decode("utf-8", errors="replace")
+            logger.error(
+                "GPU NVDEC decode failed for %s at %.3fs (exit code %d): %s",
+                rel_path,
+                timestamp,
+                proc.returncode,
+                err_text[-500:].strip(),
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "GPU NVDEC decode timed out after %ds for %s at %.3fs",
+                DECODE_TIMEOUT,
+                rel_path,
+                timestamp,
+            )
+            return None
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.error("GPU decode process error for %s at %.3fs: %s", rel_path, timestamp, exc)
+            return None
 
+    def _send_image_response(self, jpeg_bytes: bytes, send_body: bool = True) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(jpeg_bytes)))
@@ -197,7 +237,13 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
 def run() -> None:
     server_address = ("0.0.0.0", PORT)
     httpd = ThreadingHTTPServer(server_address, ThumbnailHandler)
-    logger.info("Thumbnail service listening on port %d (data: %s, ffmpeg: %s)", PORT, DATA_DIR, FFMPEG_BIN)
+    logger.info(
+        "Thumbnail service listening on port %d (data: %s, ffmpeg: %s, max_concurrent_gpu: %d)",
+        PORT,
+        DATA_DIR,
+        FFMPEG_BIN,
+        MAX_CONCURRENT_DECODES,
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
