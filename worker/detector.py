@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import nvidia.dali.experimental.dynamic as ndd
 import torch
 import torchvision.transforms.functional as TF
 from megadetector.detection import run_detector
-from nvidia.dali import fn, pipeline_def
 from torchvision import ops
 
 try:
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class DaliVideoDecoder:
-    """Hardware-accelerated video decoder using NVIDIA DALI and NVDEC."""
+    """Hardware-accelerated video decoder using NVIDIA DALI dynamic mode and NVDEC."""
 
     def __init__(
         self,
@@ -44,7 +44,7 @@ class DaliVideoDecoder:
         self.batch_size = batch_size
         self.device_id = device_id
 
-        # Quick file size verification before initializing C++ pipeline
+        # Quick file size verification before initializing C++ reader
         p = Path(self.video_path)
         if file_size is None:
             try:
@@ -55,36 +55,32 @@ class DaliVideoDecoder:
         if file_size == 0:
             raise ValueError(f"Video file is empty (0 bytes): {p.name}")
 
-        # Define DALI graph using modern experimental video reader with NVDEC
-        @pipeline_def(batch_size=self.batch_size, num_threads=4, device_id=self.device_id)
-        def video_pipe():
-            outputs = fn.experimental.readers.video(
+        device = ndd.Device("gpu", self.device_id) if self.device_id >= 0 else "cpu"
+        try:
+            self.reader = ndd.experimental.readers.Video(
                 filenames=[self.video_path],
                 sequence_length=1,
                 step=self.step,
-                enable_frame_num="scalar",
+                device=device,
+                enable_frame_num=True,
                 enable_timestamps=True,
-                device="gpu",
+                max_batch_size=self.batch_size,
             )
-            return outputs[0], outputs[1], outputs[2]
-
-        self.pipe = video_pipe()
-        try:
-            self.pipe.build()
+            meta = self.reader.get_metadata()
+            self.total_samples = meta.get("epoch_size", 0) if isinstance(meta, dict) else 0
+            if self.total_samples == 0:
+                raise ValueError(f"Video contains 0 decodeable samples: {p.name}")
         except RuntimeError as err:
             err_str = str(err)
             if "The number of input samples: 0" in err_str or "num_shards_ <= Size()" in err_str:
                 raise ValueError(f"Video contains 0 decodeable samples: {p.name}") from None
             raise
 
-        epoch_dict = self.pipe.epoch_size()
-        self.total_samples = next(iter(epoch_dict.values())) if epoch_dict else 0
-        if self.total_samples == 0:
-            raise ValueError(f"Video contains 0 decodeable samples: {p.name}")
         self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size
         self._samples_read = 0
         self.is_partial = False
         self.partial_reason: str | None = None
+        self._epoch_iter = iter(self.reader.next_epoch(batch_size=self.batch_size))
 
     @property
     def samples_read(self) -> int:
@@ -98,7 +94,9 @@ class DaliVideoDecoder:
             raise StopIteration
 
         try:
-            out = self.pipe.run()
+            batch = next(self._epoch_iter)
+        except StopIteration:
+            raise
         except RuntimeError as e:
             err_str = str(e)
             if "av_bsf_receive_packet" in err_str or "Critical error in pipeline" in err_str:
@@ -116,30 +114,29 @@ class DaliVideoDecoder:
                 raise ValueError(f"Corrupt video bitstream on initial decode: {p_name}") from None
             raise
 
-        raw_frames = torch.from_dlpack(out[0].as_tensor()).squeeze(1)  # shape: (B, H, W, 3) uint8 in VRAM
-        raw_fnums = torch.from_dlpack(out[1].as_tensor()).squeeze(-1)
-        raw_ts = torch.from_dlpack(out[2].as_tensor()).squeeze(-1)
+        raw_frames = batch[0].torch().squeeze(1)  # shape: (B, H, W, 3) uint8 in VRAM
+        raw_fnums = batch[1].torch().squeeze(-1)   # shape: (B,) int32 in VRAM
+        raw_ts = batch[2].torch().squeeze(-1)      # shape: (B,) float64 in VRAM
 
         valid_count = min(self.batch_size, self.total_samples - self._samples_read)
         self._samples_read += valid_count
 
         frames = raw_frames[:valid_count]
-        fnums = [int(n.item()) for n in raw_fnums[:valid_count]]
-        timestamps = [round(float(t.item()), 3) for t in raw_ts[:valid_count]]
+        fnums = [int(n) for n in raw_fnums[:valid_count].cpu().tolist()]
+        timestamps = [round(float(t), 3) for t in raw_ts[:valid_count].cpu().tolist()]
 
         return frames, fnums, timestamps
 
     def close(self) -> None:
-        """Release DALI pipeline and terminate background C++ prefetch worker threads."""
-        pipe = getattr(self, "pipe", None)
-        if pipe is not None:
-            self.pipe = None
+        """Release DALI reader resources."""
+        self._epoch_iter = None
+        reader = getattr(self, "reader", None)
+        if reader is not None:
+            self.reader = None
             try:
-                if hasattr(pipe, "_shutdown"):
-                    pipe._shutdown()
-                del pipe
+                del reader
             except Exception as err:  # noqa: BLE001
-                logger.debug("DALI pipeline cleanup error: %s", err)
+                logger.debug("DALI reader cleanup error: %s", err)
 
     def __del__(self) -> None:
         self.close()

@@ -258,6 +258,59 @@ class VfsPrewarmer:
                     self._prewarmed_bytes[p_str] = -1
 
 
+class ProgressWatchdog:
+    """Daemon thread watchdog that restarts the process via os.execve if processing hangs."""
+
+    def __init__(self, timeout_sec: float = 120.0) -> None:
+        self.timeout_sec = float(timeout_sec)
+        self.last_progress = time.time()
+        self._enabled = True
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="progress-watchdog")
+        self._thread.start()
+
+    def ping(self) -> None:
+        with self._lock:
+            self.last_progress = time.time()
+
+    def pause(self) -> None:
+        with self._lock:
+            self._enabled = False
+
+    def resume(self) -> None:
+        with self._lock:
+            self.last_progress = time.time()
+            self._enabled = True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            time.sleep(2)
+            with self._lock:
+                if not self._enabled:
+                    continue
+                elapsed = time.time() - self.last_progress
+                if elapsed > self.timeout_sec:
+                    logger.error(
+                        "ProgressWatchdog: No progress detected for %.1fs (timeout: %.1fs). "
+                        "Process appears hung in C++/CUDA driver. Re-executing process via os.execve...",
+                        elapsed,
+                        self.timeout_sec,
+                    )
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    try:
+                        os.execve(sys.executable, [sys.executable, *sys.argv], os.environ.copy())
+                    except Exception as err:  # noqa: BLE001
+                        logger.critical("os.execve failed: %s; forcing os._exit(1)", err)
+                        os._exit(1)
+
+
 class VideoItem:
     """Represents a discovered video and its screening state."""
 
@@ -562,6 +615,7 @@ def process_single_video(
     pbar_frames: tqdm,
     prewarmer: VfsPrewarmer,
     next_item: VideoItem | None,
+    watchdog: ProgressWatchdog | None = None,
 ) -> dict[str, Any]:
     """Execute inference on a single video with network retries and state updates."""
     video_path = item.path
@@ -617,6 +671,8 @@ def process_single_video(
                 is_annotation_pass=is_annotation_pass,
                 file_size=item.file_size,
             ):
+                if watchdog is not None:
+                    watchdog.ping()
                 status = chunk.get("status")
                 if status == "starting":
                     total_samples = chunk.get("total_samples", 0)
@@ -707,7 +763,11 @@ def process_single_video(
                     net_retry_count,
                     max_net_retries,
                 )
+                if watchdog is not None:
+                    watchdog.pause()
                 time.sleep(wait_sec)
+                if watchdog is not None:
+                    watchdog.resume()
                 continue
 
             is_cuda_fault = (
@@ -881,6 +941,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum head size (in MB) to prewarm per video during early-exit screening passes.",
     )
     parser.add_argument(
+        "--watchdog-timeout",
+        type=float,
+        default=120.0,
+        help="Timeout in seconds before restarting hung process via os.execve (0 to disable).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview queues and passes without executing inference or modifying files.",
@@ -1050,6 +1116,11 @@ def main() -> None:
         buffer_size_mb=args.prewarm_buffer_mb,
         head_size_mb=args.prewarm_head_mb,
     )
+    watchdog = (
+        ProgressWatchdog(timeout_sec=args.watchdog_timeout)
+        if args.watchdog_timeout > 0
+        else None
+    )
     pbar_frames = tqdm(total=0, desc="Frames", unit="frame", leave=False)
     start_time = time.time()
 
@@ -1099,6 +1170,7 @@ def main() -> None:
                     pbar_frames=pbar_frames,
                     prewarmer=prewarmer,
                     next_item=next_item,
+                    watchdog=watchdog,
                 )
 
                 if res.get("skipped"):
@@ -1196,6 +1268,8 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.warning("\nProcessing interrupted by user (Ctrl+C). Cleaned up gracefully.")
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         prewarmer.stop()
         pbar_frames.close()
 
