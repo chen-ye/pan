@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import services.thumbnail.server as thumb_srv
+import thumbnail.server as thumb_srv
 
 
 @pytest.fixture

@@ -2,7 +2,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile.app
+      dockerfile: backend/Dockerfile
     working_dir: /app
     volumes:
       - .:/app
@@ -20,7 +20,7 @@ services:
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile.app
+      dockerfile: frontend/Dockerfile
     working_dir: /app/frontend
     volumes:
       - .:/app
@@ -51,7 +51,7 @@ services:
               capabilities: [gpu]
 
   thumbnail:
-    build: ./services/thumbnail
+    build: ./thumbnail
     volumes:
       - nvr_data:/data:ro
       - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
@@ -89,9 +89,9 @@ services:
       - "8081:80"
       - "8443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - nvr_data:/data:ro
-      - ./certs:/etc/nginx/certs:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - app
       - frontend

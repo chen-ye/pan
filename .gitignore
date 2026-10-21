@@ -140,6 +140,7 @@ vite.config.ts.timestamp-*
 
 # Certificates
 certs/
+nginx/certs/
 
 # Python
 __pycache__/
