@@ -250,6 +250,34 @@ export class LibraryService {
     return this.library;
   }
 
+  async getVideo(relPath: string): Promise<VideoEntry | null> {
+    if (relPath.includes("..")) return null;
+    let entry = this.library.find((v) => v.path === relPath) || this.cache.get(relPath);
+    if (!entry) {
+      const fullPath = join(CONFIG.DATA_DIR, relPath);
+      try {
+        const info = await Deno.stat(fullPath);
+        if (info.isFile && this.isVideo(relPath)) {
+          entry = {
+            path: relPath,
+            name: relPath.split("/").pop() || relPath,
+            fullPath,
+            size: info.size,
+            mtime: info.mtime?.getTime() || 0,
+          };
+          this.library.push(entry);
+        }
+      } catch {
+        return null;
+      }
+    }
+    if (entry) {
+      await this.enrichEntry(entry);
+      return entry;
+    }
+    return null;
+  }
+
   async deleteVideo(relPath: string) {
     if (relPath.includes("..")) throw new Error("Invalid path");
     const fullPath = join(CONFIG.DATA_DIR, relPath);

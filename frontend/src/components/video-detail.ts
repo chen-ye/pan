@@ -68,8 +68,8 @@ function sanitizeFragment(data: Uint8Array, startTimeSec: number, timescale: num
       while (tp + 8 <= p + bSize) {
         const tbSize = view.getUint32(tp);
         const tbTag = String.fromCharCode(data[tp + 4], data[tp + 5], data[tp + 6], data[tp + 7]);
-        if (tbTag === "tfhd" && tp + 24 <= p + bSize) {
-          trkId = view.getUint32(tp + 20);
+        if (tbTag === "tfhd" && tp + 16 <= p + bSize) {
+          trkId = view.getUint32(tp + 12);
           break;
         }
         tp += tbSize;
@@ -83,28 +83,84 @@ function sanitizeFragment(data: Uint8Array, startTimeSec: number, timescale: num
 
   if (!mfhdBox || !videoTraf) return data;
 
-  // Check if tfdt already exists in videoTraf
-  let hasTfdt = false;
-  let tfhdEnd = 0;
+  // Deconstruct videoTraf boxes into an array of boxes
+  const trafBoxes: { tag: string; data: Uint8Array }[] = [];
   let tp = 8;
+  let tfdtFound = false;
   const trafView = new DataView(videoTraf.buffer, videoTraf.byteOffset, videoTraf.byteLength);
+
   while (tp + 8 <= videoTraf.length) {
     const tbSize = trafView.getUint32(tp);
     const tbTag = String.fromCharCode(videoTraf[tp + 4], videoTraf[tp + 5], videoTraf[tp + 6], videoTraf[tp + 7]);
-    if (tbTag === "tfdt") {
-      hasTfdt = true;
-      break;
-    }
+    if (tbSize < 8 || tp + tbSize > videoTraf.length) break;
+
+    const boxBytes = videoTraf.slice(tp, tp + tbSize);
+
     if (tbTag === "tfhd") {
-      tfhdEnd = tp + tbSize;
+      // tfhd: size(4), 'tfhd'(4), ver(1), flags(3), track_id(4)
+      const flags = (boxBytes[9] << 16) | (boxBytes[10] << 8) | boxBytes[11];
+      const trackId = new DataView(boxBytes.buffer, boxBytes.byteOffset).getUint32(12);
+
+      let optP = 16;
+      if (flags & 0x000001) {
+        // base-data-offset present (8 bytes) -> MUST be stripped for MSE compliance
+        optP += 8;
+      }
+      const restOfTfhd = boxBytes.subarray(optP);
+
+      // New flags: clear 0x000001 (base-data-offset), set 0x020000 (default-base-is-moof)
+      const newFlags = (flags & ~0x000001) | 0x020000;
+      const newTfhdLen = 16 + restOfTfhd.length;
+      const newTfhd = new Uint8Array(newTfhdLen);
+      const newTfhdView = new DataView(newTfhd.buffer);
+      newTfhdView.setUint32(0, newTfhdLen);
+      newTfhd.set([0x74, 0x66, 0x68, 0x64], 4); // "tfhd"
+      newTfhd[8] = boxBytes[8]; // version
+      newTfhd[9] = (newFlags >> 16) & 0xff;
+      newTfhd[10] = (newFlags >> 8) & 0xff;
+      newTfhd[11] = newFlags & 0xff;
+      newTfhdView.setUint32(12, trackId);
+      newTfhd.set(restOfTfhd, 16);
+
+      trafBoxes.push({ tag: tbTag, data: newTfhd });
+    } else if (tbTag === "tfdt") {
+      tfdtFound = true;
+      trafBoxes.push({ tag: tbTag, data: boxBytes });
+    } else if (tbTag === "trun") {
+      // In trun: size(4), 'trun'(4), ver(1), flags(3), sample_count(4)
+      const flags = (boxBytes[9] << 16) | (boxBytes[10] << 8) | boxBytes[11];
+      const sampleCount = new DataView(boxBytes.buffer, boxBytes.byteOffset).getUint32(12);
+
+      let trunBox: Uint8Array;
+      if (flags & 0x000001) {
+        // data-offset already present
+        trunBox = boxBytes;
+      } else {
+        // Add data-offset (4 bytes) and set flag 0x000001
+        const newFlags = flags | 0x000001;
+        const newLen = boxBytes.length + 4;
+        trunBox = new Uint8Array(newLen);
+        const trunView = new DataView(trunBox.buffer);
+        trunView.setUint32(0, newLen);
+        trunBox.set([0x74, 0x72, 0x75, 0x6e], 4); // "trun"
+        trunBox[8] = boxBytes[8]; // version
+        trunBox[9] = (newFlags >> 16) & 0xff;
+        trunBox[10] = (newFlags >> 8) & 0xff;
+        trunBox[11] = newFlags & 0xff;
+        trunView.setUint32(12, sampleCount);
+        trunView.setUint32(16, 0); // placeholder for data-offset
+        trunBox.set(boxBytes.subarray(16), 20);
+      }
+      trafBoxes.push({ tag: tbTag, data: trunBox });
+    } else {
+      trafBoxes.push({ tag: tbTag, data: boxBytes });
     }
+
     tp += tbSize;
   }
 
-  let finalTraf: Uint8Array = videoTraf;
-
-  if (!hasTfdt && tfhdEnd > 0) {
-    // Inject tfdt box (version 1, 64-bit baseMediaDecodeTime)
+  // If no tfdt, inject one (version 1, 20 bytes) right after tfhd
+  if (!tfdtFound) {
     const tfdtBox = new Uint8Array(20);
     const tfdtView = new DataView(tfdtBox.buffer);
     tfdtView.setUint32(0, 20);
@@ -112,22 +168,45 @@ function sanitizeFragment(data: Uint8Array, startTimeSec: number, timescale: num
     tfdtBox[8] = 1; // version 1
     const ticks = BigInt(Math.max(0, Math.round(startTimeSec * timescale)));
     tfdtView.setBigUint64(12, ticks);
-
-    const newTrafLen = videoTraf.length + 20;
-    finalTraf = new Uint8Array(newTrafLen);
-    new DataView(finalTraf.buffer).setUint32(0, newTrafLen);
-    finalTraf.set(videoTraf.subarray(4, tfhdEnd), 4);
-    finalTraf.set(tfdtBox, tfhdEnd);
-    finalTraf.set(videoTraf.subarray(tfhdEnd), tfhdEnd + 20);
+    trafBoxes.splice(1, 0, { tag: "tfdt", data: tfdtBox });
   }
 
-  // Construct pure-video moof (8 bytes header + mfhd + finalTraf)
-  const newMoofLen = 8 + mfhdBox.length + finalTraf.length;
+  // Calculate new video_traf length
+  const trafPayloadLen = trafBoxes.reduce((acc, b) => acc + b.data.length, 0);
+  const newTrafLen = 8 + trafPayloadLen;
+  const newTraf = new Uint8Array(newTrafLen);
+  const newTrafView = new DataView(newTraf.buffer);
+  newTrafView.setUint32(0, newTrafLen);
+  newTraf.set([0x74, 0x72, 0x61, 0x66], 4); // "traf"
+
+  let offsetInTraf = 8;
+  for (const b of trafBoxes) {
+    newTraf.set(b.data, offsetInTraf);
+    offsetInTraf += b.data.length;
+  }
+
+  // Calculate newMoofLen: 8 (moof header) + mfhdBox.length + newTraf.length
+  const newMoofLen = 8 + mfhdBox.length + newTraf.length;
+  const dataOffsetVal = newMoofLen + 8; // start of mdat payload
+
+  // Write data_offset into trun in newTraf
+  for (let q = 8; q + 8 <= newTraf.length; ) {
+    const s = newTrafView.getUint32(q);
+    const t = String.fromCharCode(newTraf[q + 4], newTraf[q + 5], newTraf[q + 6], newTraf[q + 7]);
+    if (t === "trun" && q + 20 <= newTraf.length) {
+      newTrafView.setInt32(q + 16, dataOffsetVal);
+      break;
+    }
+    q += s;
+  }
+
+  // Construct new moof
   const newMoof = new Uint8Array(newMoofLen);
-  new DataView(newMoof.buffer).setUint32(0, newMoofLen);
+  const newMoofView = new DataView(newMoof.buffer);
+  newMoofView.setUint32(0, newMoofLen);
   newMoof.set([0x6d, 0x6f, 0x6f, 0x66], 4); // "moof"
   newMoof.set(mfhdBox, 8);
-  newMoof.set(finalTraf, 8 + mfhdBox.length);
+  newMoof.set(newTraf, 8 + mfhdBox.length);
 
   // Combine new moof with mdat
   const mdatData = data.subarray(moofSize);
@@ -193,7 +272,11 @@ class VideoOnlyFragmentLoader implements Loader<FragmentLoaderContext> {
             activeVideoTimescale = extractTimescale(u8);
           } else if (tag === "moof") {
             const startSec = context.frag?.start ?? 0;
-            response.data = sanitizeFragment(u8, startSec, activeVideoTimescale).buffer;
+            const sanitized = sanitizeFragment(u8, startSec, activeVideoTimescale);
+            response.data = sanitized.buffer.slice(
+              sanitized.byteOffset,
+              sanitized.byteOffset + sanitized.byteLength,
+            );
           }
         }
         callbacks.onSuccess(response, stats, ctx, networkDetails);

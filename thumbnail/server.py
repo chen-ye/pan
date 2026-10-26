@@ -14,9 +14,9 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
 PORT = int(os.environ.get("PORT", "8080"))
 
-MAX_CONCURRENT_DECODES = int(os.environ.get("MAX_CONCURRENT_DECODES", "3"))
+MAX_CONCURRENT_DECODES = int(os.environ.get("MAX_CONCURRENT_DECODES", "4"))
 DECODE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_DECODES)
-DECODE_TIMEOUT = int(os.environ.get("DECODE_TIMEOUT", "20"))
+DECODE_TIMEOUT = int(os.environ.get("DECODE_TIMEOUT", "5"))
 
 MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "2048"))
 CACHE_LOCK = threading.Lock()
@@ -134,10 +134,15 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             return
 
         # Acquire concurrency semaphore to stay strictly within NVDEC hardware session limits
-        acquired = DECODE_SEMAPHORE.acquire(timeout=30)
+        acquired = DECODE_SEMAPHORE.acquire(timeout=5)
         if not acquired:
-            logger.error("GPU decode queue busy, semaphore wait timed out for %s", rel_path)
-            self.send_error(503, "GPU decode service busy, please retry")
+            logger.info("GPU decode queue busy for %s, falling back directly to CPU decode", rel_path)
+            jpeg_bytes = self._decode_frame_cpu(target_path, rel_path, timestamp, vf)
+            if jpeg_bytes is None:
+                self.send_error(500, "Frame decode failed")
+                return
+            put_cached_thumbnail(cache_key, jpeg_bytes)
+            self._send_image_response(jpeg_bytes, send_body=send_body)
             return
 
         try:
@@ -149,7 +154,11 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
 
             jpeg_bytes = self._decode_frame_gpu(target_path, rel_path, timestamp, vf)
             if jpeg_bytes is None:
-                self.send_error(500, "GPU frame decode failed")
+                logger.info("Retrying frame decode via CPU for %s at %.3fs", rel_path, timestamp)
+                jpeg_bytes = self._decode_frame_cpu(target_path, rel_path, timestamp, vf)
+
+            if jpeg_bytes is None:
+                self.send_error(500, "Frame decode failed")
                 return
 
             put_cached_thumbnail(cache_key, jpeg_bytes)
@@ -158,7 +167,7 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             DECODE_SEMAPHORE.release()
 
     def _decode_frame_gpu(self, target_path: Path, rel_path: str, timestamp: float, vf: str) -> bytes | None:
-        """Hardware-accelerated decode via NVDEC (cuda). CPU fallback is intentionally omitted."""
+        """Hardware-accelerated decode via NVDEC (cuda)."""
         cmd = [
             FFMPEG_BIN,
             "-hwaccel",
@@ -170,6 +179,9 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             f"{timestamp:.3f}",
             "-i",
             str(target_path),
+            "-an",
+            "-sn",
+            "-dn",
             "-vf",
             vf,
             "-vframes",
@@ -213,6 +225,55 @@ class ThumbnailHandler(BaseHTTPRequestHandler):
             return None
         except (subprocess.SubprocessError, OSError) as exc:
             logger.error("GPU decode process error for %s at %.3fs: %s", rel_path, timestamp, exc)
+            return None
+
+    def _decode_frame_cpu(self, target_path: Path, rel_path: str, timestamp: float, vf: str) -> bytes | None:
+        """Fallback CPU decode in case GPU decode or CUDA lock times out."""
+        cmd = [
+            FFMPEG_BIN,
+            "-threads",
+            "2",
+            "-nostdin",
+            "-an",
+            "-sn",
+            "-dn",
+            "-ss",
+            f"{timestamp:.3f}",
+            "-i",
+            str(target_path),
+            "-vf",
+            vf,
+            "-vframes",
+            "1",
+            "-f",
+            "image2",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "3",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+            err_text = proc.stderr.decode("utf-8", errors="replace")
+            logger.error(
+                "CPU fallback decode failed for %s at %.3fs (exit code %d): %s",
+                rel_path,
+                timestamp,
+                proc.returncode,
+                err_text[-500:].strip(),
+            )
+            return None
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.error("CPU fallback decode process error for %s at %.3fs: %s", rel_path, timestamp, exc)
             return None
 
     def _send_image_response(self, jpeg_bytes: bytes, send_body: bool = True) -> None:

@@ -67,7 +67,12 @@ class AppRoot extends SignalWatcher(LitElement) {
   override connectedCallback() {
     super.connectedCallback();
     this.state.fetchDirs();
-    this.state.loadVideos(true);
+    this.state.loadVideos(true).then(() => {
+      const initialVideo = this.state.currentVideoPath.get();
+      if (initialVideo) {
+        this.state.selectVideo(initialVideo);
+      }
+    });
     // Periodically sync queue status if processing
     setInterval(() => {
         if (this.state.processingJob.get() || this.state.processingQueue.get().length > 0) {

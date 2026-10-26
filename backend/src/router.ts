@@ -294,6 +294,21 @@ router.all("/api/worker/(.*)", async (ctx) => {
   }
 });
 
+// 7.4 Get Single Video Metadata
+router.get("/api/videos/info", async (ctx) => {
+  const path = ctx.request.url.searchParams.get("path");
+  if (!path || path.includes("..")) {
+    ctx.throw(400, "Invalid path");
+    return;
+  }
+  const video = await libraryService.getVideo(path);
+  if (!video) {
+    ctx.throw(404, "Video not found");
+    return;
+  }
+  ctx.response.body = video;
+});
+
 // 7.5 Get HLS M3U8 Playlist
 router.get("/api/videos/m3u8", async (ctx) => {
   const videoPath = ctx.request.url.searchParams.get("path");

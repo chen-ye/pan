@@ -275,8 +275,24 @@ export class State {
     }
 
     // Find video object to check processed status immediately from list if possible
-    const videos = this.videos.get();
-    const vid = videos.find((v) => v.path === path);
+    let vid = this.videos.get().find((v) => v.path === path);
+
+    // If video not in currently loaded paginated slice, fetch its metadata from server
+    if (!vid) {
+      try {
+        const infoRes = await fetch(`/api/videos/info?path=${encodeURIComponent(path)}`);
+        if (infoRes.ok) {
+          const info = await infoRes.json() as Video;
+          const currentList = this.videos.get();
+          if (!currentList.some((v) => v.path === path)) {
+            this.videos.set([info, ...currentList]);
+          }
+          vid = info;
+        }
+      } catch (e) {
+        console.warn("Failed to fetch video metadata for off-page item", e);
+      }
+    }
 
     if (vid && vid.processed) {
       try {
