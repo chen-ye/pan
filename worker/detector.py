@@ -751,6 +751,7 @@ class VideoProcessor:
                                 "frame": early_exit_frame,
                                 "detections_count": len(results_list),
                             }
+                            break
                 except ValueError as val_err:
                     logger.warning(
                         "Skipping corrupt or un-decodable video during decode (%s): %s",
