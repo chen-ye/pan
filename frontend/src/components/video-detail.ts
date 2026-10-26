@@ -1,6 +1,13 @@
 import { css, html, LitElement } from "lit";
 import { SignalWatcher } from "@lit-labs/signals";
-import Hls from "hls.js";
+import Hls, {
+  type FragmentLoaderContext,
+  type HlsConfig,
+  type Loader,
+  type LoaderCallbacks,
+  type LoaderConfiguration,
+  type LoaderStats,
+} from "hls.js";
 import { State } from "../state.ts";
 import type { Detection } from "../types.ts";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
@@ -15,6 +22,185 @@ function formatDuration(seconds?: number) {
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
   return (h > 0 ? `${h}h ` : "") + `${m}m ${s}s`;
+}
+
+function extractTimescale(buf: Uint8Array): number {
+  for (let i = 0; i <= buf.length - 24; i++) {
+    if (
+      buf[i] === 0x6d && // 'm'
+      buf[i + 1] === 0x64 && // 'd'
+      buf[i + 2] === 0x68 && // 'h'
+      buf[i + 3] === 0x64 // 'd'
+    ) {
+      const ver = buf[i + 4];
+      const view = new DataView(buf.buffer, buf.byteOffset + i);
+      const ts = ver === 1 ? view.getUint32(24) : view.getUint32(16);
+      if (ts > 0) return ts;
+    }
+  }
+  return 150000;
+}
+
+function sanitizeFragment(data: Uint8Array, startTimeSec: number, timescale: number): Uint8Array {
+  if (data.length < 16) return data;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+  // Check if first box is moof
+  const moofSize = view.getUint32(0);
+  const tag = String.fromCharCode(data[4], data[5], data[6], data[7]);
+  if (tag !== "moof" || moofSize > data.length || moofSize < 16) return data;
+
+  let p = 8;
+  let mfhdBox: Uint8Array | null = null;
+  let videoTraf: Uint8Array | null = null;
+
+  while (p + 8 <= moofSize) {
+    const bSize = view.getUint32(p);
+    const bTag = String.fromCharCode(data[p + 4], data[p + 5], data[p + 6], data[p + 7]);
+    if (bSize < 8 || p + bSize > moofSize) break;
+
+    if (bTag === "mfhd") {
+      mfhdBox = data.subarray(p, p + bSize);
+    } else if (bTag === "traf") {
+      // Find tfhd inside traf to check track ID
+      let tp = p + 8;
+      let trkId = 0;
+      while (tp + 8 <= p + bSize) {
+        const tbSize = view.getUint32(tp);
+        const tbTag = String.fromCharCode(data[tp + 4], data[tp + 5], data[tp + 6], data[tp + 7]);
+        if (tbTag === "tfhd" && tp + 24 <= p + bSize) {
+          trkId = view.getUint32(tp + 20);
+          break;
+        }
+        tp += tbSize;
+      }
+      if (trkId === 1) { // Video track ID
+        videoTraf = data.subarray(p, p + bSize);
+      }
+    }
+    p += bSize;
+  }
+
+  if (!mfhdBox || !videoTraf) return data;
+
+  // Check if tfdt already exists in videoTraf
+  let hasTfdt = false;
+  let tfhdEnd = 0;
+  let tp = 8;
+  const trafView = new DataView(videoTraf.buffer, videoTraf.byteOffset, videoTraf.byteLength);
+  while (tp + 8 <= videoTraf.length) {
+    const tbSize = trafView.getUint32(tp);
+    const tbTag = String.fromCharCode(videoTraf[tp + 4], videoTraf[tp + 5], videoTraf[tp + 6], videoTraf[tp + 7]);
+    if (tbTag === "tfdt") {
+      hasTfdt = true;
+      break;
+    }
+    if (tbTag === "tfhd") {
+      tfhdEnd = tp + tbSize;
+    }
+    tp += tbSize;
+  }
+
+  let finalTraf: Uint8Array = videoTraf;
+
+  if (!hasTfdt && tfhdEnd > 0) {
+    // Inject tfdt box (version 1, 64-bit baseMediaDecodeTime)
+    const tfdtBox = new Uint8Array(20);
+    const tfdtView = new DataView(tfdtBox.buffer);
+    tfdtView.setUint32(0, 20);
+    tfdtBox.set([0x74, 0x66, 0x64, 0x74], 4); // "tfdt"
+    tfdtBox[8] = 1; // version 1
+    const ticks = BigInt(Math.max(0, Math.round(startTimeSec * timescale)));
+    tfdtView.setBigUint64(12, ticks);
+
+    const newTrafLen = videoTraf.length + 20;
+    finalTraf = new Uint8Array(newTrafLen);
+    new DataView(finalTraf.buffer).setUint32(0, newTrafLen);
+    finalTraf.set(videoTraf.subarray(4, tfhdEnd), 4);
+    finalTraf.set(tfdtBox, tfhdEnd);
+    finalTraf.set(videoTraf.subarray(tfhdEnd), tfhdEnd + 20);
+  }
+
+  // Construct pure-video moof (8 bytes header + mfhd + finalTraf)
+  const newMoofLen = 8 + mfhdBox.length + finalTraf.length;
+  const newMoof = new Uint8Array(newMoofLen);
+  new DataView(newMoof.buffer).setUint32(0, newMoofLen);
+  newMoof.set([0x6d, 0x6f, 0x6f, 0x66], 4); // "moof"
+  newMoof.set(mfhdBox, 8);
+  newMoof.set(finalTraf, 8 + mfhdBox.length);
+
+  // Combine new moof with mdat
+  const mdatData = data.subarray(moofSize);
+  const result = new Uint8Array(newMoofLen + mdatData.length);
+  result.set(newMoof, 0);
+  result.set(mdatData, newMoofLen);
+  return result;
+}
+
+let activeVideoTimescale = 150000;
+
+class VideoOnlyFragmentLoader implements Loader<FragmentLoaderContext> {
+  private loader: Loader<FragmentLoaderContext>;
+
+  constructor(config: HlsConfig) {
+    this.loader = new (Hls.DefaultConfig.loader as any)(config);
+  }
+
+  get context(): FragmentLoaderContext | null {
+    return this.loader.context;
+  }
+
+  set context(val: FragmentLoaderContext | null) {
+    this.loader.context = val;
+  }
+
+  get stats(): LoaderStats {
+    return this.loader.stats;
+  }
+
+  set stats(val: LoaderStats) {
+    this.loader.stats = val;
+  }
+
+  destroy(): void {
+    this.loader.destroy();
+  }
+
+  abort(): void {
+    this.loader.abort();
+  }
+
+  getCacheAge(): number | null {
+    return this.loader.getCacheAge ? this.loader.getCacheAge() : null;
+  }
+
+  getResponseHeader(name: string): string | null {
+    return this.loader.getResponseHeader ? this.loader.getResponseHeader(name) : null;
+  }
+
+  load(
+    context: FragmentLoaderContext,
+    config: LoaderConfiguration,
+    callbacks: LoaderCallbacks<FragmentLoaderContext>,
+  ): void {
+    const wrappedCallbacks: LoaderCallbacks<FragmentLoaderContext> = {
+      ...callbacks,
+      onSuccess: (response, stats, ctx, networkDetails) => {
+        if (response.data instanceof ArrayBuffer && response.data.byteLength >= 16) {
+          const u8 = new Uint8Array(response.data);
+          const tag = String.fromCharCode(u8[4], u8[5], u8[6], u8[7]);
+          if (tag === "ftyp" || tag === "moov") {
+            activeVideoTimescale = extractTimescale(u8);
+          } else if (tag === "moof") {
+            const startSec = context.frag?.start ?? 0;
+            response.data = sanitizeFragment(u8, startSec, activeVideoTimescale).buffer;
+          }
+        }
+        callbacks.onSuccess(response, stats, ctx, networkDetails);
+      },
+    };
+    this.loader.load(context, config, wrappedCallbacks);
+  }
 }
 
 export class VideoDetail extends SignalWatcher(LitElement) {
@@ -293,6 +479,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
         enableWorker: true,
+        fLoader: VideoOnlyFragmentLoader,
         manifestLoadingTimeOut: 45000,
         manifestLoadingMaxRetry: 4,
         manifestLoadingRetryDelay: 1000,
@@ -354,6 +541,7 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       });
 
       let networkRetryCount = 0;
+      let mediaRetryCount = 0;
       const MAX_NETWORK_RETRIES = 3;
 
       hls.loadSource(m3u8Url);
@@ -361,11 +549,13 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         networkRetryCount = 0;
+        mediaRetryCount = 0;
         video.play().catch(() => {});
       });
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
         networkRetryCount = 0;
+        mediaRetryCount = 0;
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -394,8 +584,13 @@ export class VideoDetail extends SignalWatcher(LitElement) {
               break;
             }
             case Hls.ErrorTypes.MEDIA_ERROR:
-              console.warn(`HLS media error (${data.details}), attempting recovery...`);
-              hls.recoverMediaError();
+              if (mediaRetryCount < 1) {
+                mediaRetryCount++;
+                console.warn(`HLS media error (${data.details}), attempting recovery...`);
+                hls.recoverMediaError();
+              } else {
+                fallbackToMp4(`Unrecoverable media error (${data.details})`);
+              }
               break;
             default:
               fallbackToMp4(`${data.details}: ${data.error?.message || data.error}`);
@@ -428,8 +623,6 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
     if (currentPath !== this.lastVideoPath) {
       this.lastVideoPath = currentPath;
-      const gallery = this.shadowRoot?.querySelector("#thumbnail-gallery");
-      if (gallery) gallery.innerHTML = "";
 
       const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
       if (video) {

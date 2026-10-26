@@ -68,6 +68,21 @@ test("debug video playback and Hls.js", async ({ page }) => {
     };
   });
 
+  console.log("=== CODEC SUPPORT ===");
+  const codecSupport = await page.evaluate(() => {
+    return {
+      mse_hvc1: MediaSource.isTypeSupported('video/mp4; codecs="hvc1"'),
+      mse_hvc1_sample: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L150"'),
+      mse_hvc1_sample_b: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"'),
+      mse_hev1: MediaSource.isTypeSupported('video/mp4; codecs="hev1"'),
+      mse_avc: MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+      canPlay_hvc1: document.createElement("video").canPlayType('video/mp4; codecs="hvc1"'),
+      canPlay_hev1: document.createElement("video").canPlayType('video/mp4; codecs="hev1"'),
+      canPlay_mp4: document.createElement("video").canPlayType('video/mp4'),
+    };
+  });
+  console.log(JSON.stringify(codecSupport, null, 2));
+
   console.log("=== VIDEO ELEMENT STATS ===");
   console.log(JSON.stringify(videoStats, null, 2));
 
