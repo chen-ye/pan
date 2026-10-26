@@ -18,12 +18,16 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    Draft202012Validator = None
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -131,8 +135,31 @@ def convert_legacy_to_megadetector(
     metadata = legacy_data.get("metadata") or {}
     fps = float(metadata.get("fps", 12.0))
     total_frames = int(metadata.get("total_frames", 0))
-    width = int(metadata.get("width", 1920))
-    height = int(metadata.get("height", 1080))
+    width = int(metadata.get("width", 0))
+    height = int(metadata.get("height", 0))
+
+    # Detect 4K vs 1080p if dimensions are missing or coordinates exceed 1080p
+    has_4k_coords = False
+    for ann in legacy_data.get("annotations", []):
+        for b in ann.get("bbox", []):
+            if len(b) >= 4 and (b[0] > 1920 or b[1] > 1080 or b[2] > 1920 or b[3] > 1080):
+                has_4k_coords = True
+                break
+        if has_4k_coords:
+            break
+    if not has_4k_coords:
+        for d in legacy_data.get("detections", []):
+            b = d.get("bbox", [])
+            if len(b) >= 4 and (b[0] > 1920 or b[1] > 1080 or b[2] > 1920 or b[3] > 1080):
+                has_4k_coords = True
+                break
+
+    if has_4k_coords:
+        width = 3840
+        height = 2160
+    elif width <= 0 or height <= 0:
+        width = 1920
+        height = 1080
     is_partial = bool(legacy_data.get("partial", metadata.get("partial", False)))
     partial_reason = legacy_data.get("partial_reason", metadata.get("partial_reason"))
 
@@ -140,30 +167,80 @@ def convert_legacy_to_megadetector(
     raw_detections = legacy_data.get("detections") or []
     converted_detections: list[dict[str, Any]] = []
 
-    for d in raw_detections:
-        raw_cat = str(d.get("category", "1")).lower()
-        cat_id = CATEGORY_NAME_TO_ID.get(raw_cat, "1")
+    if not raw_detections and "annotations" in legacy_data and isinstance(legacy_data["annotations"], list):
+        file_categories = legacy_data.get("categories") or {}
+        fps = float(metadata.get("fps", 2.0))
+        for ann in legacy_data["annotations"]:
+            frame_num = int(ann.get("img_id", 0))
+            ts = round(frame_num / fps, 3) if fps > 0 else 0.0
+            bboxes = ann.get("bbox") or []
+            categories = ann.get("category") or []
+            confidences = ann.get("confidence") or []
+            for i in range(len(bboxes)):
+                raw_box = bboxes[i] or [0.0, 0.0, 0.0, 0.0]
+                x1 = float(raw_box[0])
+                y1 = float(raw_box[1])
+                x2 = float(raw_box[2])
+                y2 = float(raw_box[3])
+                if x1 > 1.0 or y1 > 1.0 or x2 > 1.0 or y2 > 1.0:
+                    x1 = max(0.0, min(1.0, x1 / width)) if width > 0 else 0.0
+                    y1 = max(0.0, min(1.0, y1 / height)) if height > 0 else 0.0
+                    x2 = max(0.0, min(1.0, x2 / width)) if width > 0 else 0.0
+                    y2 = max(0.0, min(1.0, y2 / height)) if height > 0 else 0.0
+                else:
+                    x1 = max(0.0, min(1.0, x1))
+                    y1 = max(0.0, min(1.0, y1))
+                    x2 = max(0.0, min(1.0, x2))
+                    y2 = max(0.0, min(1.0, y2))
+                w = max(0.0, min(1.0 - x1, x2 - x1))
+                h = max(0.0, min(1.0 - y1, y2 - y1))
+                raw_cat = categories[i] if i < len(categories) else "0"
+                raw_cat_str = str(raw_cat).lower()
+                resolved_name = file_categories.get(raw_cat_str) or DEFAULT_CATEGORIES.get(raw_cat_str, "animal")
+                cat_id = CATEGORY_NAME_TO_ID.get(resolved_name.lower(), "1")
+                conf = float(confidences[i]) if i < len(confidences) else 0.0
+                converted_detections.append({
+                    "category": cat_id,
+                    "conf": round(conf, 4),
+                    "bbox": [round(x1, 5), round(y1, 5), round(w, 5), round(h, 5)],
+                    "frame_number": frame_num,
+                    "timestamp": ts,
+                })
+    else:
+        for d in raw_detections:
+            raw_cat = str(d.get("category", "1")).lower()
+            cat_id = CATEGORY_NAME_TO_ID.get(raw_cat, "1")
 
-        conf = float(d.get("conf", 0.0))
-        frame_num = int(d.get("frame_number", d.get("frame", 0)))
-        ts = round(float(d.get("timestamp", 0.0)), 3)
+            conf = float(d.get("conf", 0.0))
+            frame_num = int(d.get("frame_number", d.get("frame", 0)))
+            ts = round(float(d.get("timestamp", 0.0)), 3)
 
-        raw_box = d.get("bbox", [0.0, 0.0, 0.0, 0.0])
-        x1 = max(0.0, min(1.0, float(raw_box[0])))
-        y1 = max(0.0, min(1.0, float(raw_box[1])))
-        x2 = max(0.0, min(1.0, float(raw_box[2])))
-        y2 = max(0.0, min(1.0, float(raw_box[3])))
+            raw_box = d.get("bbox", [0.0, 0.0, 0.0, 0.0])
+            x1 = float(raw_box[0])
+            y1 = float(raw_box[1])
+            x2 = float(raw_box[2])
+            y2 = float(raw_box[3])
+            if x1 > 1.0 or y1 > 1.0 or x2 > 1.0 or y2 > 1.0:
+                x1 = max(0.0, min(1.0, x1 / width)) if width > 0 else 0.0
+                y1 = max(0.0, min(1.0, y1 / height)) if height > 0 else 0.0
+                x2 = max(0.0, min(1.0, x2 / width)) if width > 0 else 0.0
+                y2 = max(0.0, min(1.0, y2 / height)) if height > 0 else 0.0
+            else:
+                x1 = max(0.0, min(1.0, x1))
+                y1 = max(0.0, min(1.0, y1))
+                x2 = max(0.0, min(1.0, x2))
+                y2 = max(0.0, min(1.0, y2))
 
-        w = max(0.0, min(1.0 - x1, x2 - x1))
-        h = max(0.0, min(1.0 - y1, y2 - y1))
+            w = max(0.0, min(1.0 - x1, x2 - x1))
+            h = max(0.0, min(1.0 - y1, y2 - y1))
 
-        converted_detections.append({
-            "category": cat_id,
-            "conf": round(conf, 4),
-            "bbox": [round(x1, 5), round(y1, 5), round(w, 5), round(h, 5)],
-            "frame_number": frame_num,
-            "timestamp": ts,
-        })
+            converted_detections.append({
+                "category": cat_id,
+                "conf": round(conf, 4),
+                "bbox": [round(x1, 5), round(y1, 5), round(w, 5), round(h, 5)],
+                "frame_number": frame_num,
+                "timestamp": ts,
+            })
 
     # Determine completion time from file modification time
     try:
@@ -250,10 +327,21 @@ def parse_args() -> argparse.Namespace:
         help="Delete empty 0-byte sidecar files so videos can be freshly re-processed.",
     )
     parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a .bak copy of original sidecars before overwriting.",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=0,
         help="Limit processing to first N discovered files (0 for unlimited).",
+    )
+    parser.add_argument(
+        "--file-list",
+        type=str,
+        default=None,
+        help="Path to file containing sidecar paths (one per line).",
     )
     return parser.parse_args()
 
@@ -262,7 +350,13 @@ def main() -> None:
     args = parse_args()
 
     input_paths = list(args.paths)
-    if not input_paths:
+    if args.file_list:
+        with open(args.file_list, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    input_paths.append(stripped)
+    elif not input_paths:
         default_dir = Path("/mnt/y/NVR/NVR-unprocessed")
         if default_dir.exists():
             input_paths = [str(default_dir)]
@@ -330,7 +424,16 @@ def main() -> None:
                 continue
 
             if not args.dry_run:
+                if args.backup:
+                    bak_path = file_path.with_name(f"{file_path.name}.bak")
+                    if not bak_path.exists():
+                        shutil.copy2(file_path, bak_path)
                 save_atomic_json(file_path, converted)
+                if not file_path.name.endswith(".mp4.json"):
+                    mp4_candidate = file_path.with_suffix(".mp4")
+                    if mp4_candidate.exists():
+                        mp4_sidecar = file_path.parent / f"{mp4_candidate.name}.json"
+                        save_atomic_json(mp4_sidecar, converted)
 
             migrated_count += 1
 

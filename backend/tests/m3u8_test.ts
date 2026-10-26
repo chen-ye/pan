@@ -206,6 +206,7 @@ Deno.test("M3u8Service - getOrGenerateSidecar generates, caches, and invalidates
   const testFileName = `temp_test_m3u8_${Date.now()}.mp4`;
   const fullPath = join(CONFIG.DATA_DIR, testFileName);
   const sidecarPath = `${fullPath}.m3u8`;
+  await Deno.mkdir(CONFIG.DATA_DIR, { recursive: true });
   await Deno.writeFile(fullPath, fmp4Data);
 
   try {

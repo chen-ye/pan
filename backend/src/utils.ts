@@ -131,8 +131,11 @@ export function normalizeLegacyFormat(data: any): any {
     const framesProcessedSet = new Set<number>();
 
     const normalizedDetections: Detection[] = data.detections.map((d: any) => {
-      const catName = String(d.category || "unknown");
-      const catId = NAME_TO_CATEGORY_ID[catName] || "1";
+      const rawCat = String(d.category ?? "1");
+      const catName = DEFAULT_DETECTION_CATEGORIES[rawCat] || rawCat;
+      const catId =
+        NAME_TO_CATEGORY_ID[catName.toLowerCase()] ||
+        (DEFAULT_DETECTION_CATEGORIES[rawCat] ? rawCat : "1");
       const frameNum =
         d.frame !== undefined
           ? d.frame
@@ -150,10 +153,17 @@ export function normalizeLegacyFormat(data: any): any {
 
       // Convert legacy corner bbox [x1, y1, x2, y2] -> [x, y, w, h]
       const rawBbox = d.bbox || [0, 0, 0, 0];
-      const x1 = rawBbox[0] ?? 0;
-      const y1 = rawBbox[1] ?? 0;
-      const x2 = rawBbox[2] ?? 0;
-      const y2 = rawBbox[3] ?? 0;
+      let x1 = rawBbox[0] ?? 0;
+      let y1 = rawBbox[1] ?? 0;
+      let x2 = rawBbox[2] ?? 0;
+      let y2 = rawBbox[3] ?? 0;
+
+      if (x1 > 1.0 || y1 > 1.0 || x2 > 1.0 || y2 > 1.0) {
+        x1 = Math.max(0, Math.min(1, x1 / width));
+        y1 = Math.max(0, Math.min(1, y1 / height));
+        x2 = Math.max(0, Math.min(1, x2 / width));
+        y2 = Math.max(0, Math.min(1, y2 / height));
+      }
 
       let w = Math.max(0, x2 - x1);
       let h = Math.max(0, y2 - y1);
@@ -227,6 +237,33 @@ export function normalizeLegacyFormat(data: any): any {
   if (data.annotations && Array.isArray(data.annotations)) {
     const detections: Detection[] = [];
     const framesProcessedSet = new Set<number>();
+    const fileCategories: Record<string, string> = data.categories || {};
+    const fps = data.metadata?.fps || 2;
+    const totalFrames = data.annotations.length;
+    let width = data.metadata?.width || 0;
+    let height = data.metadata?.height || 0;
+
+    // Detect 4K vs 1080p if dimensions are missing or coordinates exceed 1080p
+    let has4kCoords = false;
+    for (const ann of data.annotations) {
+      if (ann.bbox) {
+        for (const b of ann.bbox) {
+          if (b && ((b[0] ?? 0) > 1920 || (b[1] ?? 0) > 1080 || (b[2] ?? 0) > 1920 || (b[3] ?? 0) > 1080)) {
+            has4kCoords = true;
+            break;
+          }
+        }
+      }
+      if (has4kCoords) break;
+    }
+
+    if (has4kCoords) {
+      width = 3840;
+      height = 2160;
+    } else if (width <= 0 || height <= 0) {
+      width = 1920;
+      height = 1080;
+    }
 
     data.annotations.forEach((ann: LegacyAnnotation) => {
       const frameNum = parseInt(ann.img_id || "0");
@@ -237,30 +274,57 @@ export function normalizeLegacyFormat(data: any): any {
 
       for (let i = 0; i < bboxes.length; i++) {
         const rawBox = bboxes[i] || [0, 0, 0, 0];
-        const x1 = rawBox[0] ?? 0;
-        const y1 = rawBox[1] ?? 0;
-        const x2 = rawBox[2] ?? 0;
-        const y2 = rawBox[3] ?? 0;
-        const w = Math.max(0, x2 - x1);
-        const h = Math.max(0, y2 - y1);
-        const catName = categories[i] || "unknown";
+        let x1 = rawBox[0] ?? 0;
+        let y1 = rawBox[1] ?? 0;
+        let x2 = rawBox[2] ?? 0;
+        let y2 = rawBox[3] ?? 0;
+
+        if (x1 > 1.0 || y1 > 1.0 || x2 > 1.0 || y2 > 1.0) {
+          x1 = Math.max(0, Math.min(1, x1 / width));
+          y1 = Math.max(0, Math.min(1, y1 / height));
+          x2 = Math.max(0, Math.min(1, x2 / width));
+          y2 = Math.max(0, Math.min(1, y2 / height));
+        }
+
+        let w = Math.max(0, x2 - x1);
+        let h = Math.max(0, y2 - y1);
+        if (w === 0 && x2 > 0) w = x2;
+        if (h === 0 && y2 > 0) h = y2;
+
+        const rawCat = categories[i];
+        let catName: string;
+        let catId: string;
+
+        if (rawCat !== undefined && rawCat !== null) {
+          const rawCatStr = String(rawCat);
+          catName =
+            fileCategories[rawCatStr] ||
+            DEFAULT_DETECTION_CATEGORIES[rawCatStr] ||
+            rawCatStr;
+          catId =
+            NAME_TO_CATEGORY_ID[catName.toLowerCase()] ||
+            (DEFAULT_DETECTION_CATEGORIES[rawCatStr] ? rawCatStr : "1");
+        } else {
+          catName = "unknown";
+          catId = "1";
+        }
 
         detections.push({
           frame: frameNum,
           frame_number: frameNum,
-          timestamp: frameNum / 2, // Assume 2fps processing
+          timestamp: Number((frameNum / fps).toFixed(3)),
           category: catName,
-          category_id: NAME_TO_CATEGORY_ID[catName] || "1",
-          conf: confidences[i] || 0,
-          bbox: [x1, y1, w, h],
+          category_id: catId,
+          conf: Number((confidences[i] || 0).toFixed(4)),
+          bbox: [
+            Number(x1.toFixed(5)),
+            Number(y1.toFixed(5)),
+            Number(w.toFixed(5)),
+            Number(h.toFixed(5)),
+          ],
         });
       }
     });
-
-    const fps = data.metadata?.fps || 2;
-    const totalFrames = data.annotations.length;
-    const width = data.metadata?.width || 1920;
-    const height = data.metadata?.height || 1080;
 
     return {
       info: {
