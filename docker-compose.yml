@@ -97,6 +97,7 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - nvr_data:/data:ro
       - ./nginx/certs:/etc/nginx/certs:ro
+      - thumbnail_cache:/var/cache/nginx/thumbnails
     depends_on:
       - app
       - frontend
@@ -104,6 +105,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  thumbnail_cache:
   nvr_data:
     driver: rclone
     driver_opts:

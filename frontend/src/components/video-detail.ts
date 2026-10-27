@@ -9,7 +9,14 @@ import Hls, {
   type LoaderStats,
 } from "hls.js";
 import { State } from "../state.ts";
-import type { Detection } from "../types.ts";
+import {
+  bucketDetectionMarkers,
+  buildChronoUrl,
+  buildFilmstripUrl,
+  computeScrubPercent,
+  computeScrubTimestamp,
+  formatScrubTime,
+} from "../utils/scrubber.ts";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "@shoelace-style/shoelace/dist/components/icon/icon.js";
 import "@shoelace-style/shoelace/dist/components/range/range.js";
@@ -222,7 +229,10 @@ class VideoOnlyFragmentLoader implements Loader<FragmentLoaderContext> {
   private loader: Loader<FragmentLoaderContext>;
 
   constructor(config: HlsConfig) {
-    this.loader = new (Hls.DefaultConfig.loader as any)(config);
+    const DefaultLoader = Hls.DefaultConfig.loader as unknown as new (
+      cfg: HlsConfig,
+    ) => Loader<FragmentLoaderContext>;
+    this.loader = new DefaultLoader(config);
   }
 
   get context(): FragmentLoaderContext | null {
@@ -287,15 +297,42 @@ class VideoOnlyFragmentLoader implements Loader<FragmentLoaderContext> {
 }
 
 export class VideoDetail extends SignalWatcher(LitElement) {
-  state!: State;
-  animReq: number | undefined;
+  declare state: State;
+  declare showChrono: boolean;
+  declare scrubPreviewTime: number | null;
+  declare scrubPreviewPct: number;
+  declare filmstripError: boolean;
+  declare chronoError: boolean;
 
-  lastVideoPath: string | null = null;
-  private hls: Hls | null = null;
+  animReq: number | undefined;
+  lastVideoPath: string | null;
+  private renderedVideoPath: string | null;
+  private hls: Hls | null;
+  private isDraggingScrubber: boolean;
+  private wasPlayingBeforeScrub: boolean;
 
   static override properties = {
     state: { attribute: false },
+    showChrono: { state: true },
+    scrubPreviewTime: { state: true },
+    scrubPreviewPct: { state: true },
+    filmstripError: { state: true },
+    chronoError: { state: true },
   };
+
+  constructor() {
+    super();
+    this.showChrono = false;
+    this.scrubPreviewTime = null;
+    this.scrubPreviewPct = 0;
+    this.filmstripError = false;
+    this.chronoError = false;
+    this.lastVideoPath = null;
+    this.renderedVideoPath = null;
+    this.hls = null;
+    this.isDraggingScrubber = false;
+    this.wasPlayingBeforeScrub = false;
+  }
 
   static override styles = [css`
     :host {
@@ -343,6 +380,86 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       height: 100%;
       pointer-events: none;
       z-index: 10;
+    }
+    .chrono-overlay {
+      max-width: 100%;
+      max-height: 100%;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      z-index: 15;
+      background: #000;
+    }
+    .filmstrip-scrubber {
+      background: #111318;
+      padding: 6px var(--sl-spacing-medium);
+      border-top: 1px solid #262932;
+      flex-shrink: 0;
+    }
+    .filmstrip-track {
+      position: relative;
+      height: 44px;
+      border-radius: 6px;
+      background: #1e222b;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+      user-select: none;
+      touch-action: none;
+      cursor: ew-resize;
+    }
+    .filmstrip-clip {
+      position: absolute;
+      inset: 0;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .filmstrip-img {
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: block;
+      pointer-events: none;
+    }
+    .filmstrip-marker {
+      position: absolute;
+      bottom: 0;
+      width: 2px;
+      height: 6px;
+      transform: translateX(-50%);
+      border-radius: 1px 1px 0 0;
+      pointer-events: none;
+      opacity: 0.95;
+      box-shadow: 0 0 2px rgba(0, 0, 0, 0.75);
+    }
+    .filmstrip-playhead {
+      position: absolute;
+      top: -3px;
+      bottom: -3px;
+      left: var(--playhead-pct, 0%);
+      width: 3px;
+      transform: translateX(-50%);
+      background: #ffffff;
+      border-radius: 2px;
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.65), 0 1px 4px rgba(0, 0, 0, 0.8);
+      pointer-events: none;
+      z-index: 4;
+    }
+    .scrub-tooltip {
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 0;
+      transform: translateX(-50%);
+      background: rgba(15, 17, 23, 0.92);
+      color: #ffffff;
+      font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      white-space: nowrap;
+      pointer-events: none;
+      z-index: 20;
     }
     .controls-bar {
       /* ... existing styles */
@@ -415,6 +532,12 @@ export class VideoDetail extends SignalWatcher(LitElement) {
       .video-container {
         min-height: 200px;
       }
+      .filmstrip-scrubber {
+        padding: 4px var(--sl-spacing-small);
+      }
+      .filmstrip-track {
+        height: 36px;
+      }
       .controls-bar {
         flex-wrap: wrap;
         padding: var(--sl-spacing-small);
@@ -458,7 +581,35 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
   animationLoop() {
     this.drawOverlays();
+    this.syncPlayhead();
     this.animReq = requestAnimationFrame(() => this.animationLoop());
+  }
+
+  private getEffectiveDuration(video?: HTMLVideoElement | null): number {
+    const domVideo = video ?? (this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null);
+    if (domVideo && Number.isFinite(domVideo.duration) && domVideo.duration > 0) {
+      return domVideo.duration;
+    }
+    const currentPath = this.state?.currentVideoPath.get();
+    if (!currentPath) return 0;
+    const vidData = this.state.videos.get().find((item) => item.path === currentPath);
+    return vidData?.duration && Number.isFinite(vidData.duration) && vidData.duration > 0
+      ? vidData.duration
+      : 0;
+  }
+
+  private syncPlayhead() {
+    if (this.isDraggingScrubber) return;
+    const track = this.shadowRoot?.querySelector("#filmstrip-track") as HTMLElement | null;
+    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null;
+    if (!track || !video) return;
+    const duration = this.getEffectiveDuration(video);
+    if (duration <= 0) {
+      track.style.setProperty("--playhead-pct", "0%");
+      return;
+    }
+    const pct = Math.max(0, Math.min(100, (video.currentTime / duration) * 100));
+    track.style.setProperty("--playhead-pct", `${pct.toFixed(3)}%`);
   }
 
   drawOverlays() {
@@ -693,6 +844,19 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     }
   }
 
+  override willUpdate() {
+    const currentPath = this.state?.currentVideoPath.get() ?? null;
+    if (currentPath !== this.renderedVideoPath) {
+      this.renderedVideoPath = currentPath;
+      this.showChrono = false;
+      this.filmstripError = false;
+      this.chronoError = false;
+      this.scrubPreviewTime = null;
+      this.isDraggingScrubber = false;
+      this.wasPlayingBeforeScrub = false;
+    }
+  }
+
   override updated() {
     const currentPath = this.state?.currentVideoPath.get();
     if (!currentPath) {
@@ -706,6 +870,8 @@ export class VideoDetail extends SignalWatcher(LitElement) {
 
     if (currentPath !== this.lastVideoPath) {
       this.lastVideoPath = currentPath;
+      const track = this.shadowRoot?.querySelector("#filmstrip-track") as HTMLElement | null;
+      track?.style.setProperty("--playhead-pct", "0%");
 
       const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
       if (video) {
@@ -740,6 +906,11 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     const isProcessingCurrent = job && job.path === currentPath;
     const processingStatus = isProcessingCurrent ? job.status : null;
     const processingProgress = isProcessingCurrent ? job.progress : 0;
+    const effectiveDuration = this.getEffectiveDuration();
+    const detectionMarkers = bucketDetectionMarkers(
+      results?.detections ?? [],
+      effectiveDuration,
+    );
 
     return html`
       <div class="video-container">
@@ -756,6 +927,67 @@ export class VideoDetail extends SignalWatcher(LitElement) {
             >
             </video>
             <canvas id="overlay-canvas"></canvas>
+            ${this.showChrono
+              ? html`
+                <img
+                  class="chrono-overlay"
+                  width="1280"
+                  height="720"
+                  decoding="async"
+                  src="${buildChronoUrl(currentPath, 1280)}"
+                  alt="Chronophotograph summary"
+                  @error="${this.onChronoError}"
+                />
+              `
+              : ""}
+        </div>
+      </div>
+
+      <div class="filmstrip-scrubber">
+        <div
+          id="filmstrip-track"
+          class="filmstrip-track"
+          @pointerdown="${this.onScrubPointerDown}"
+          @pointermove="${this.onScrubPointerMove}"
+          @pointerup="${this.onScrubPointerUp}"
+          @pointercancel="${this.onScrubPointerUp}"
+          @pointerleave="${this.onScrubPointerLeave}"
+        >
+          <div class="filmstrip-clip">
+            ${!this.filmstripError
+              ? html`
+                <img
+                  class="filmstrip-img"
+                  width="1280"
+                  height="72"
+                  decoding="async"
+                  src="${buildFilmstripUrl(currentPath)}"
+                  alt=""
+                  draggable="false"
+                  @error="${this.onFilmstripError}"
+                />
+              `
+              : ""}
+            ${detectionMarkers.map(
+              (marker) => html`
+                <span
+                  class="filmstrip-marker"
+                  style="left: ${marker.pct}%; background: ${marker.color};"
+                ></span>
+              `,
+            )}
+          </div>
+          <div class="filmstrip-playhead"></div>
+          ${this.scrubPreviewTime !== null
+            ? html`
+              <div
+                class="scrub-tooltip"
+                style="left: ${this.scrubPreviewPct.toFixed(2)}%"
+              >
+                ${formatScrubTime(this.scrubPreviewTime)}
+              </div>
+            `
+            : ""}
         </div>
       </div>
 
@@ -768,9 +1000,22 @@ export class VideoDetail extends SignalWatcher(LitElement) {
           max="18"
           step="0.5"
           .value="${playbackSpeed}"
-          @sl-change="${(e: Event) =>
-            this.setSpeed((e.target as HTMLInputElement).value)}"
+          @sl-change="${(evt: Event) =>
+            this.setSpeed((evt.target as HTMLInputElement).value)}"
         ></sl-range>
+
+        ${!this.chronoError
+          ? html`
+            <sl-button
+              size="small"
+              variant="${this.showChrono ? "primary" : "default"}"
+              @click="${this.toggleChrono}"
+            >
+              <sl-icon slot="prefix" name="layers"></sl-icon>
+              Chronophoto
+            </sl-button>
+          `
+          : ""}
 
         <div class="spacer"></div>
 
@@ -900,7 +1145,92 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     `;
   }
 
+  private toggleChrono() {
+    const nextState = !this.showChrono;
+    this.showChrono = nextState;
+    if (nextState) {
+      const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null;
+      video?.pause();
+    }
+  }
+
+  private onChronoError() {
+    this.chronoError = true;
+    this.showChrono = false;
+  }
+
+  private onFilmstripError() {
+    this.filmstripError = true;
+  }
+
+  private onScrubPointerDown(evt: PointerEvent) {
+    if (evt.pointerType === "mouse" && evt.button !== 0) return;
+    const track = evt.currentTarget as HTMLElement;
+    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null;
+    const duration = this.getEffectiveDuration(video);
+    if (!video || duration <= 0) return;
+
+    evt.preventDefault();
+    track.setPointerCapture(evt.pointerId);
+    this.isDraggingScrubber = true;
+    this.wasPlayingBeforeScrub = !video.paused;
+    video.pause();
+    if (this.showChrono) {
+      this.showChrono = false;
+    }
+
+    const rect = track.getBoundingClientRect();
+    const pct = computeScrubPercent(evt.clientX, rect.left, rect.width);
+    const targetTime = computeScrubTimestamp(evt.clientX, rect.left, rect.width, duration);
+    video.currentTime = targetTime;
+    track.style.setProperty("--playhead-pct", `${pct.toFixed(3)}%`);
+    this.scrubPreviewPct = pct;
+    this.scrubPreviewTime = targetTime;
+  }
+
+  private onScrubPointerMove(evt: PointerEvent) {
+    const track = evt.currentTarget as HTMLElement;
+    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null;
+    const duration = this.getEffectiveDuration(video);
+    if (duration <= 0) return;
+
+    const rect = track.getBoundingClientRect();
+    const pct = computeScrubPercent(evt.clientX, rect.left, rect.width);
+    const targetTime = computeScrubTimestamp(evt.clientX, rect.left, rect.width, duration);
+    this.scrubPreviewPct = pct;
+    this.scrubPreviewTime = targetTime;
+
+    if (this.isDraggingScrubber && video) {
+      video.currentTime = targetTime;
+      track.style.setProperty("--playhead-pct", `${pct.toFixed(3)}%`);
+    }
+  }
+
+  private onScrubPointerUp(evt: PointerEvent) {
+    if (!this.isDraggingScrubber) return;
+    const track = evt.currentTarget as HTMLElement;
+    if (track.hasPointerCapture(evt.pointerId)) {
+      track.releasePointerCapture(evt.pointerId);
+    }
+    this.isDraggingScrubber = false;
+    const video = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement | null;
+    if (this.wasPlayingBeforeScrub && video) {
+      video.play().catch(() => {});
+    }
+    this.wasPlayingBeforeScrub = false;
+    if (evt.type === "pointercancel" || evt.pointerType !== "mouse") {
+      this.scrubPreviewTime = null;
+    }
+  }
+
+  private onScrubPointerLeave() {
+    if (!this.isDraggingScrubber) {
+      this.scrubPreviewTime = null;
+    }
+  }
+
   seekToTimestamp(timestamp: number) {
+    this.showChrono = false;
     const mainVideo = this.shadowRoot?.querySelector("#main-video") as HTMLVideoElement;
     if (mainVideo) {
       mainVideo.currentTime = timestamp;
@@ -909,9 +1239,10 @@ export class VideoDetail extends SignalWatcher(LitElement) {
     }
   }
 
-  onVideoLoad(e: Event) {
-    const video = e.target as HTMLVideoElement;
+  onVideoLoad(evt: Event) {
+    const video = evt.target as HTMLVideoElement;
     video.playbackRate = this.state.playbackSpeed.get();
+    this.requestUpdate();
   }
 
   setSpeed(speed: string) {

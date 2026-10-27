@@ -5,7 +5,8 @@
   },
   "imports": {
     "vite": "npm:vite@^7.2.6",
-    "vite-plugin-static-copy": "npm:vite-plugin-static-copy@^2.3.0"
+    "vite-plugin-static-copy": "npm:vite-plugin-static-copy@^2.3.0",
+    "@std/assert": "jsr:@std/assert@^1.0.0"
   },
   "lint": {
     "rules": {

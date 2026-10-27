@@ -3,6 +3,7 @@ import { repeat } from "lit/directives/repeat.js";
 import { SignalWatcher } from "@lit-labs/signals";
 import { State } from "../state.ts";
 import type { Video } from "../types.ts";
+import { buildChronoUrl } from "../utils/scrubber.ts";
 import "@shoelace-style/shoelace/dist/components/icon-button/icon-button.js";
 import "@shoelace-style/shoelace/dist/components/button/button.js";
 import "@shoelace-style/shoelace/dist/components/dropdown/dropdown.js";
@@ -99,19 +100,37 @@ export class VideoList extends SignalWatcher(LitElement) {
       background-color: var(--sl-color-primary-50);
       border-left: 4px solid var(--sl-color-primary-600);
     }
+    .video-thumb {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--sl-color-neutral-200);
+    }
+    .video-thumb[hidden] {
+      display: none;
+    }
+    .video-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .video-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
     .video-title {
       font-weight: 500;
       font-size: 0.9rem;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-    }
-    .video-meta {
-      font-size: 0.75rem;
-      color: var(--sl-color-neutral-500);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+      flex: 1;
+      min-width: 0;
     }
     .tag-container {
       display: flex;
@@ -252,9 +271,6 @@ export class VideoList extends SignalWatcher(LitElement) {
         font-size: 0.65rem;
         padding: 1px 4px;
       }
-      .video-meta {
-        font-size: 0.7rem;
-      }
       .section-title {
         font-size: 0.7rem;
       }
@@ -263,6 +279,13 @@ export class VideoList extends SignalWatcher(LitElement) {
 
   override connectedCallback() {
     super.connectedCallback();
+  }
+
+  private onThumbError(evt: Event) {
+    const img = evt.currentTarget as HTMLImageElement | null;
+    if (img?.parentElement) {
+      img.parentElement.hidden = true;
+    }
   }
 
   override render() {
@@ -333,17 +356,43 @@ export class VideoList extends SignalWatcher(LitElement) {
 
       ${repeat(
         this.state.videos.get(),
-        (v: Video) => v.path,
-        (v: Video) => {
+        (video: Video) => video.path,
+        (video: Video, index: number) => {
           const job = this.state.processingJob.get();
-          const isProcessing = job && job.path === v.path;
+          const isProcessing = job && job.path === video.path;
           return html`
-            <div class="video-item ${this.state.currentVideoPath.get() === v.path ? "active" : ""}"
-                 @click="${() => this.state.selectVideo(v.path)}">
-              <div class="video-title" title="${v.name}">${v.name}</div>
+            <div class="video-item ${this.state.currentVideoPath.get() === video.path ? "active" : ""}"
+                 @click="${() => this.state.selectVideo(video.path)}">
+              <div class="video-thumb">
+                <img
+                  width="320"
+                  height="180"
+                  loading="${index < 4 ? "eager" : "lazy"}"
+                  decoding="async"
+                  src="${buildChronoUrl(video.path, 320)}"
+                  alt=""
+                  @error="${this.onThumbError}"
+                />
+              </div>
+              <div class="video-header-row">
+                <div class="video-title" title="${video.name}">${video.name}</div>
+                ${isProcessing
+                  ? html`<sl-spinner style="font-size: 1rem; --track-width: 2px;"></sl-spinner>`
+                  : html`
+                    <sl-icon-button
+                      name="trash"
+                      class="delete-btn"
+                      label="Delete"
+                      @click="${(evt: Event) => {
+                        evt.stopPropagation();
+                        this.state.deleteVideo(video.path);
+                      }}"
+                    ></sl-icon-button>
+                  `}
+              </div>
               <div class="tag-container">
                 ${(() => {
-                  const state = v.state || (v.processed ? (v.classifications?.length ? "annotated" : "blank") : "unprocessed");
+                  const state = video.state || (video.processed ? (video.classifications?.length ? "annotated" : "blank") : "unprocessed");
                   switch (state) {
                     case "candidate":
                       return html`<span class="tag state-candidate">Candidate</span>`;
@@ -358,35 +407,19 @@ export class VideoList extends SignalWatcher(LitElement) {
                       return html`<span class="tag state-unprocessed">Unprocessed</span>`;
                   }
                 })()}
-                ${v.state === "candidate" && v.stride ? html`<span class="tag info-stride">Stride ${v.stride}</span>` : ""}
-                ${(v.state === "detected" || v.state === "annotated") && v.classifications
-                  ? v.classifications
+                ${video.state === "candidate" && video.stride ? html`<span class="tag info-stride">Stride ${video.stride}</span>` : ""}
+                ${(video.state === "detected" || video.state === "annotated") && video.classifications
+                  ? video.classifications
                       .map(formatClassification)
                       .filter(categoryName => categoryName.toLowerCase() !== "upload")
                       .map(categoryName => html`<span class="tag processed category-${categoryName.toLowerCase()}">${categoryName}</span>`)
                   : ""}
-                ${v.classifications?.some(category => formatClassification(category).toLowerCase() === "upload")
+                ${video.classifications?.some(category => formatClassification(category).toLowerCase() === "upload")
                   ? html`<span class="tag upload-tag">Upload</span>`
                   : ""}
                 ${isProcessing ? html`<span class="tag progress">${Math.round((job?.progress || 0) * 100)}%</span>` : ""}
-                <span class="tag">${formatSize(v.size)}</span>
-                ${v.duration ? html`<span class="tag">${formatDuration(v.duration)}</span>` : ""}
-              </div>
-              <div class="video-meta">
-                <span>Video</span>
-                ${isProcessing
-                  ? html`<sl-spinner style="font-size: 1rem; --track-width: 2px;"></sl-spinner>`
-                  : html`
-                    <sl-icon-button
-                      name="trash"
-                      class="delete-btn"
-                      label="Delete"
-                      @click="${(e: Event) => {
-                        e.stopPropagation();
-                        this.state.deleteVideo(v.path);
-                      }}"
-                    ></sl-icon-button>
-                  `}
+                <span class="tag">${formatSize(video.size)}</span>
+                ${video.duration ? html`<span class="tag">${formatDuration(video.duration)}</span>` : ""}
               </div>
             </div>
           `;

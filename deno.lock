@@ -788,6 +788,7 @@
       },
       "frontend": {
         "dependencies": [
+          "jsr:@std/assert@1",
           "npm:vite-plugin-static-copy@^2.3.0",
           "npm:vite@^7.2.6"
         ],
